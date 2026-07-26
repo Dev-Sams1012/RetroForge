@@ -1,5 +1,1 @@
-void hello_core();
-int main() {
-  hello_core();
-  return 0;
-}
+int main(int argc, char **argv) { return 0; }
