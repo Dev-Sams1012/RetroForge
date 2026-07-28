@@ -10,7 +10,6 @@ namespace retroforge::identification {
 using retroforge::models::Console;
 
 class IConsoleDetector {
-
   public:
     virtual ~IConsoleDetector() = default;
     virtual bool matches(const std::vector<uint8_t> &cabecalho) const = 0;
