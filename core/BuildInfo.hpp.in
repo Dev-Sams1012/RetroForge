@@ -1,0 +1,16 @@
+#pragma once
+
+#include <string_view>
+
+namespace retroforge::core {
+
+class BuildInfo {
+  public:
+    static constexpr int major = @PROJECT_VERSION_MAJOR@;
+    static constexpr int minor = @PROJECT_VERSION_MINOR@;
+    static constexpr int patch = @PROJECT_VERSION_PATCH@;
+
+    static constexpr std::string_view version_string() { return "@PROJECT_VERSION@"; }
+};
+
+} // namespace retroforge::core

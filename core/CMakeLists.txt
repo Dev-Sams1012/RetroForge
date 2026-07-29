@@ -15,4 +15,14 @@ target_include_directories(retroforge_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/BuildInfo.hpp.in
+    ${CMAKE_BINARY_DIR}/generated/BuildInfo.hpp
+    @ONLY
+)
+
+target_include_directories(retroforge_core PUBLIC
+    ${CMAKE_BINARY_DIR}/generated
+)
+
 target_compile_features(retroforge_core PUBLIC cxx_std_20)
