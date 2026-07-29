@@ -1,2 +1,7 @@
 CompileFlags:
   CompilationDatabase: build
+
+If:
+  PathMatch: .*\.in$
+Diagnostics:
+  Suppress: "*"
