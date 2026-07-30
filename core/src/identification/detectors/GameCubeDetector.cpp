@@ -6,6 +6,10 @@ bool GameCubeDetector::matches(const std::vector<uint8_t> &cabecalho) const {
     constexpr size_t OFFSET_ASSINATURA = 0x1C;
     constexpr uint32_t MAGIC_GAMECUBE = 0xC2339F3D;
 
+    if (cabecalho.empty()) {
+        return false;
+    };
+
     if (cabecalho.size() < OFFSET_ASSINATURA + 4) {
         return false;
     }

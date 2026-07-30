@@ -1,11 +1,11 @@
-#include "retroforge/identification/detectors/Ps1Detector.hpp"
+#include "retroforge/identification/detectors/Ps2Detector.hpp"
 
 #include <algorithm>
 #include <string_view>
 
 namespace retroforge::identification::detectors {
 
-bool Ps1Detector::matches(const std::vector<uint8_t> &cabecalho) const {
+bool Ps2Detector::matches(const std::vector<uint8_t> &cabecalho) const {
     static constexpr std::string_view SYSTEM_CNF = "SYSTEM.CNF";
     static constexpr std::string_view BOOT2 = "BOOT2";
 
@@ -19,7 +19,7 @@ bool Ps1Detector::matches(const std::vector<uint8_t> &cabecalho) const {
     bool tem_boot2 = std::search(cabecalho.begin(), cabecalho.end(), BOOT2.begin(), BOOT2.end()) !=
                      cabecalho.end();
 
-    return tem_system_cnf && !tem_boot2;
+    return tem_system_cnf && tem_boot2;
 }
 
 } // namespace retroforge::identification::detectors
