@@ -1,20 +1,24 @@
 \section{Módulo 3: O Motor de Recomendação (Smart Context) e Compressores Externos}
 
 Com o Módulo 2 encerrado, o RetroForge já sabe responder a uma pergunta fundamental: \textit{``que console é esse arquivo?''}.
-O \texttt{ConsoleIdentifier} devolve, com segurança e sem depender de internet, um valor de \texttt{Console} (definido uma única vez em \texttt{models/Console.hpp}, desde o Módulo 0) -- inclusive o valor sentinela \texttt{Console::DreamcastModificado}, que existe especificamente para impedir uma tragédia (US06).
+O \texttt{ConsoleIdentifier} devolve, com segurança e sem depender de internet, um valor de \texttt{Console} (definido uma única vez em \texttt{models/Console.hpp}, desde o Módulo 0) -- inclusive os dois valores sentinela que existem especificamente para impedir tragédias (US06 e sua extensão): \texttt{Console::DreamcastModificado} e \texttt{Console::PSP\_PBP}.
 
 Mas identificar não é agir. Um \texttt{Console::PS2} sozinho não comprime nada;
 alguém precisa traduzir ``isso é um PS2'' em ``rode o \texttt{chdman} com estes argumentos, e não o \texttt{maxcso}''.
 Esse ``alguém'' é o Motor de Recomendação -- o \textbf{Smart Context} descrito na Seção 3.2 da documentação v2.0 -- e é o assunto deste módulo.
 
 \begin{CaixaInfo}[title={O que já existe vs. o que este módulo constrói}]
-Do Módulo 0 e do Módulo 2, já temos prontos: \texttt{models::Console} (a única fonte de verdade do vocabulário de consoles, reexportada por \texttt{identification::Console} desde o Módulo 0 -- incluindo o valor \texttt{DreamcastModificado} e as adições \texttt{SegaCD} e \texttt{Saturn}, ampliadas no Módulo 2), \texttt{ConsoleIdentifier}, os detectores de \texttt{PS1/PS2/GameCube/PSP/Dreamcast/SegaCD/Saturn}, o \texttt{CueSheetResolver}, e duas classes de infraestrutura que vamos \textbf{reaproveitar} agora pela primeira vez fora do Módulo 0: \texttt{io::BinaryFileReader} e \texttt{process::ExternalProcessHandle}.
+Do Módulo 0 e do Módulo 2, já temos prontos: \texttt{models::Console} (a única fonte de verdade do vocabulário de consoles, reexportada por \texttt{identification::Console} desde o Módulo 0 -- incluindo \texttt{DreamcastModificado}, as adições \texttt{SegaCD} e \texttt{Saturn}, \textbf{e} a distinção \texttt{PSP} vs.\ \texttt{PSP\_PBP}, todas ampliadas no Módulo 2), \texttt{ConsoleIdentifier}, os detectores de \texttt{PS1/PS2/GameCube/PSP/PBP/Dreamcast/SegaCD/Saturn}, o \texttt{CueSheetResolver}, e duas classes de infraestrutura que vamos \textbf{reaproveitar} agora pela primeira vez fora do Módulo 0: \texttt{io::BinaryFileReader} e \texttt{process::ExternalProcessHandle}.
 
 No repositório público do projeto (\texttt{github.com/Dev-Sams1012/RetroForge}), o estado atual ainda reflete exatamente isso: as pastas \texttt{core/}, \texttt{cli/} e \texttt{external/} existem, mas \texttt{external/} só contém o submódulo \texttt{CLI11} -- não há, ainda, nenhuma pasta \texttt{compression/} dentro de \texttt{core/include/retroforge/}, nem qualquer integração real com \texttt{chdman}, \texttt{maxcso}, \texttt{dolphin-tool} ou \texttt{libzip}.
 
-Este módulo é exatamente o que falta escrever e commitar para que esse gap feche: vamos (1) criar a interface \texttt{ICompressionStrategy}, (2) implementar \texttt{ChdmanConverter}, \texttt{DolphinToolConverter} e (como exercício guiado) \texttt{MaxcsoConverter} -- todos por trás de \texttt{ExternalProcessHandle}, (3) implementar \texttt{LibzipPacker}, que \textbf{não} usa subprocesso, e (4) construir o \texttt{CompressionRouter} que orquestra tudo isso e bloqueia explicitamente o \texttt{DreamcastModificado}.
+Este módulo é exatamente o que falta escrever e commitar para que esse gap feche: vamos (1) criar a interface \texttt{ICompressionStrategy}, (2) implementar \texttt{ChdmanConverter}, \texttt{DolphinToolConverter} e (como exercício guiado) \texttt{MaxcsoConverter} -- todos por trás de \texttt{ExternalProcessHandle}, (3) implementar \texttt{LibzipPacker}, que \textbf{não} usa subprocesso, e (4) construir o \texttt{CompressionRouter} que orquestra tudo isso e bloqueia explicitamente \textbf{os dois} valores sentinela que o Módulo 2 introduziu.
 
-Diferente da primeira versão deste módulo, \textbf{não} precisamos mais corrigir nenhuma divergência de vocabulário: como o Módulo 0 já unificou \texttt{Console} em um único arquivo (\texttt{models/Console.hpp}), \texttt{ConversionJob} e \texttt{ConsoleIdentifier} sempre enxergaram exatamente o mesmo tipo -- inclusive os novos valores introduzidos no Módulo 2.
+\begin{CaixaAlerta}[title={Correção em relação a uma versão anterior deste módulo}]
+Uma versão anterior deste módulo tratava apenas de \texttt{Console::DreamcastModificado} como caso a bloquear, porque, na época em que foi escrita, o Módulo 2 ainda não havia introduzido \texttt{Console::PSP\_PBP}. Isso mudou: o Módulo 2, ao formalizar o detector \texttt{PbpDetector} (Seção sobre o ``irmão perigoso do PSP''), deixou explícito que um contêiner \texttt{EBOOT.PBP} é estruturalmente o mesmo tipo de risco que um \texttt{.cdi} de Dreamcast -- e que \texttt{PSP\_PBP} ``vai precisar exatamente do mesmo tratamento de trava explícita que \texttt{DreamcastModificado} recebeu'' assim que este módulo fosse revisado. Esta é essa revisão: o \texttt{CompressionRouter} apresentado a seguir bloqueia \textbf{ambos} os valores sentinela, com o mesmo \texttt{if} explícito e antecipado -- nenhuma rota é registrada para nenhum dos dois, e a ausência de registro nunca é, sozinha, o mecanismo de segurança.
+\end{CaixaAlerta}
+
+Fora essa correção, não precisamos corrigir nenhuma outra divergência de vocabulário: como o Módulo 0 já unificou \texttt{Console} em um único arquivo (\texttt{models/Console.hpp}), \texttt{ConversionJob} e \texttt{ConsoleIdentifier} sempre enxergaram exatamente o mesmo tipo -- inclusive todos os valores introduzidos no Módulo 2.
 \end{CaixaInfo}
 
 \subsection{Do ``identificar'' ao ``agir'': por que o roteamento é uma classe separada}
@@ -27,13 +31,13 @@ O RetroForge rejeita essa abordagem por três razões, todas já sementadas no M
 ele não deveria saber nada sobre \texttt{chdman} ou \texttt{maxcso}. Se amanhã o projeto trocar \texttt{maxcso} por outra ferramenta de compressão de PSP, isso não pode exigir tocar em uma linha sequer do Motor de Identificação.
     \item \textbf{Separação Core/Apresentação:} a documentação estabelece que \texttt{cli/} (e a futura \texttt{gui/}, Módulo 11) são camadas de apresentação.
 Se a lógica de roteamento vivesse dentro de \texttt{cli/main.cpp}, a futura \texttt{gui/} teria que \textbf{duplicar} essa lógica -- exatamente o tipo de acoplamento que o \texttt{core/} existe para evitar.
-    \item \textbf{Testabilidade (Módulo 12):} testar ``um \texttt{Console::PSP} deve acionar o \texttt{MaxcsoConverter}'' é trivial se o roteamento for uma classe isolada do \texttt{core}.
+    \item \textbf{Testabilidade (Módulo 12):} testar ``um \texttt{Console::PSP} deve acionar o \texttt{MaxcsoConverter}'' -- e ``um \texttt{Console::PSP\_PBP} deve ser bloqueado'' -- é trivial se o roteamento for uma classe isolada do \texttt{core}.
 Se essa decisão estivesse espalhada dentro de um \texttt{main()} que também lê argumentos de linha de comando, testá-la exigiria simular todo um processo de CLI.
 \end{itemize}
 
 \begin{CaixaAlerta}
-Vale repetir, porque é o motivador histórico do projeto inteiro (ver \textit{Motivação e História do Projeto}): o roteamento errado -- mandar um \texttt{.cdi} modificado de Dreamcast para o \texttt{chdman} -- não é um bug cosmético, é o bug que \textbf{inspirou} o RetroForge.
-O Motor de Recomendação deste módulo é, literalmente, o código que existe para que aquele incidente nunca se repita.
+Vale repetir, porque é o motivador histórico do projeto inteiro (ver \textit{Motivação e História do Projeto}): o roteamento errado -- mandar um \texttt{.cdi} modificado de Dreamcast para o \texttt{chdman}, ou um \texttt{EBOOT.PBP} já empacotado para o \texttt{maxcso} -- não é um bug cosmético, é o \textbf{mesmo padrão} de bug que \textbf{inspirou} o RetroForge, apenas manifestado em dois consoles diferentes.
+O Motor de Recomendação deste módulo é, literalmente, o código que existe para que aquele incidente nunca se repita -- em nenhuma das duas formas que ele pode assumir.
 \end{CaixaAlerta}
 
 \subsection{Duas naturezas de compressão, uma única abstração}
@@ -97,7 +101,7 @@ A seta de dependência aponta sempre de quem sabe menos para quem sabe mais sobr
 \end{CaixaInfo}
 
 \begin{CaixaInfo}
-Vale uma pausa para apreciar um não-evento: diferente do que aconteceria se o projeto tivesse dois enums \texttt{Console} independentes (um em \texttt{models/}, outro em \texttt{identification/}), \texttt{job->console\_alvo()} já devolve, neste exato momento, o mesmo tipo -- incluindo \texttt{DreamcastModificado}, \texttt{SegaCD} e \texttt{Saturn} -- que \texttt{ConsoleIdentifier::identify()} produziu no Módulo 2. Isso só é verdade porque o Módulo 0 tomou a decisão de extrair \texttt{Console} para \texttt{models/Console.hpp} \textbf{antes} de qualquer código depender dele, e o Módulo 2 amplificou aquele único arquivo, não uma cópia.
+Vale uma pausa para apreciar um não-evento: diferente do que aconteceria se o projeto tivesse dois enums \texttt{Console} independentes (um em \texttt{models/}, outro em \texttt{identification/}), \texttt{job->console\_alvo()} já devolve, neste exato momento, o mesmo tipo -- incluindo \texttt{DreamcastModificado}, \texttt{PSP\_PBP}, \texttt{SegaCD} e \texttt{Saturn} -- que \texttt{ConsoleIdentifier::identify()} produziu no Módulo 2. Isso só é verdade porque o Módulo 0 tomou a decisão de extrair \texttt{Console} para \texttt{models/Console.hpp} \textbf{antes} de qualquer código depender dele, e o Módulo 2 amplificou aquele único arquivo, não uma cópia.
 O \texttt{CompressionRouter} que vamos construir nesta seção pode, portanto, confiar cegamente em \texttt{job->console\_alvo()} para distinguir rotas específicas, sem nenhuma etapa de conciliação entre vocabulários.
 \end{CaixaInfo}
 
@@ -261,7 +265,7 @@ bool DolphinToolConverter::comprimir(const std::shared_ptr<models::ConversionJob
 \end{CaixaCodigo}
 
 \begin{CaixaInfo}
-\texttt{MaxcsoConverter} (para PSP $\rightarrow$ \texttt{.cso}) é estruturalmente idêntico aos dois acima -- só o comando (\texttt{maxcso "origem" -o "destino"}) e a extensão (\texttt{.cso}) mudam.
+\texttt{MaxcsoConverter} (para \texttt{Console::PSP} -- o \texttt{.iso} cru, \textbf{nunca} \texttt{PSP\_PBP} -- $\rightarrow$ \texttt{.cso}) é estruturalmente idêntico aos dois acima -- só o comando (\texttt{maxcso "origem" -o "destino"}) e a extensão (\texttt{.cso}) mudam.
 Por isso, assim como o Módulo 2 fez com \texttt{PspDetector}, deixamos sua implementação completa como o Exercício 3.1: o valor didático está em você reconhecer o padrão repetido, não em copiar um quarto bloco de código quase idêntico.
 \end{CaixaInfo}
 
@@ -380,7 +384,7 @@ Chegamos à classe que dá nome ao módulo.
 O \texttt{CompressionRouter} é o Smart Context da documentação: ele recebe um \texttt{ConversionJob} já identificado e decide, com base no \texttt{Console} alvo, qual \texttt{ICompressionStrategy} executar -- ou se a execução deve ser \textbf{bloqueada}.
 
 \begin{itemize}
-    \item \textbf{Por que \texttt{CompressionRouter} existe:} é a única classe que conhece a tabela de roteamento completa (``PS1/PS2/Sega CD/Saturn/Dreamcast limpo $\rightarrow$ CHD; GameCube $\rightarrow$ RVZ; PSP $\rightarrow$ CSO; \texttt{DreamcastModificado} $\rightarrow$ bloqueado'').
+    \item \textbf{Por que \texttt{CompressionRouter} existe:} é a única classe que conhece a tabela de roteamento completa (``PS1/PS2/Sega CD/Saturn/Dreamcast limpo $\rightarrow$ CHD; GameCube $\rightarrow$ RVZ; PSP (cru) $\rightarrow$ CSO; \texttt{DreamcastModificado} $\rightarrow$ bloqueado; \texttt{PSP\_PBP} $\rightarrow$ bloqueado'').
 Nenhuma outra classe do projeto -- nem os conversores, nem o identificador -- precisa saber essa tabela inteira.
     \item \textbf{Como se comunica com outras classes:} depende apenas da abstração \texttt{ICompressionStrategy} (nunca de \texttt{ChdmanConverter} diretamente -- Inversão de Dependência), recebe estratégias via \texttt{register\_strategy} (Princípio Aberto/Fechado, no mesmo espírito de \texttt{ConsoleIdentifier::register\_detector} do Módulo 0) e é consumido pela camada de apresentação (\texttt{cli/}, e futuramente \texttt{gui/}) depois que \texttt{ConsoleIdentifier::identify} já devolveu um \texttt{Console}.
     \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/compression/CompressionRouter.hpp} e \texttt{core/src/compression/CompressionRouter.cpp} -- direto dentro de \texttt{compression/}, ao lado de \texttt{ICompressionStrategy.hpp} (e não dentro de \texttt{converters/}, porque ela não é uma estratégia -- ela \textit{orquestra} estratégias, o mesmo papel que \texttt{ConsoleIdentifier} tem em relação aos detectores).
@@ -434,6 +438,7 @@ private:
 
 \begin{CaixaCodigo}
 // Arquivo: core/src/compression/CompressionRouter.cpp
+// (CORRIGIDO neste modulo -- ver CaixaAlerta no inicio da secao para o motivo)
 #include "retroforge/compression/CompressionRouter.hpp"
 
 namespace retroforge::compression {
@@ -446,11 +451,15 @@ void CompressionRouter::register_strategy(Console console,
 }
 
 ResultadoRoteamento CompressionRouter::rotear(const std::shared_ptr<models::ConversionJob>& job) {
-    // A trava de seguranca (US06) vem ANTES de qualquer consulta ao mapa
-    // de estrategias. Mesmo que, por engano, alguem registre uma
-    // estrategia para DreamcastModificado no futuro, este bloqueio
-    // explicito impede que ela seja alcancada.
-    if (job->console_alvo() == Console::DreamcastModificado) {
+    // A trava de seguranca (US06 e sua extensao ao PSP, Modulo 2) vem
+    // ANTES de qualquer consulta ao mapa de estrategias. Dois valores de
+    // Console sao sentinelas de risco -- DreamcastModificado (.cdi) e
+    // PSP_PBP (EBOOT.PBP ja empacotado) -- e NENHUM dos dois pode ser
+    // alcancado, mesmo que, por engano, alguem registre uma estrategia
+    // para eles no futuro (ver construir_motor_de_recomendacao() adiante,
+    // que deliberadamente nunca registra rota para nenhum dos dois).
+    if (job->console_alvo() == Console::DreamcastModificado ||
+        job->console_alvo() == Console::PSP_PBP) {
         return ResultadoRoteamento::BloqueadoPorSeguranca;
     }
 
@@ -469,9 +478,8 @@ ResultadoRoteamento CompressionRouter::rotear(const std::shared_ptr<models::Conv
 \end{CaixaCodigo}
 
 \begin{CaixaAlerta}
-Repare que o bloqueio de \texttt{DreamcastModificado} é feito com um \texttt{if} \textbf{explícito}, checado antes de qualquer coisa -- não com um simples ``esquecer de registrar uma estratégia para esse valor''.
-A diferença é sutil, mas crucial: se dependêssemos apenas de \textit{não registrar} uma estratégia, um futuro contribuidor (Módulo 14) poderia, por engano, registrar \texttt{ChdmanConverter} também para \texttt{DreamcastModificado} ``para não deixar nenhum console sem rota'' -- reintroduzindo exatamente o bug motivador do projeto.
-A trava explícita, verificada antes do \texttt{unordered\_map}, é \textbf{impossível de contornar por acidente}.
+Repare que o bloqueio de \texttt{DreamcastModificado} \textbf{e} de \texttt{PSP\_PBP} é feito com um único \texttt{if} \textbf{explícito}, checado antes de qualquer coisa -- não com um simples ``esquecer de registrar uma estratégia para esses valores''.
+A diferença é sutil, mas crucial: se dependêssemos apenas de \textit{não registrar} uma estratégia, um futuro contribuidor (Módulo 14) poderia, por engano, registrar \texttt{MaxcsoConverter} também para \texttt{PSP\_PBP} ``porque afinal é PSP, e PSP vai para o \texttt{maxcso}'' -- reintroduzindo exatamente o bug motivador do projeto, desta vez pela porta do PSP em vez da porta do Dreamcast. A trava explícita, verificada antes do \texttt{unordered\_map} e cobrindo \textbf{ambos} os valores sentinela, é \textbf{impossível de contornar por acidente} -- mesmo que o \texttt{enum class Console} ganhe um terceiro, quarto ou quinto valor sentinela em módulos futuros, o padrão a seguir já está estabelecido aqui.
 \end{CaixaAlerta}
 
 Montando o motor de recomendação completo -- o equivalente, para compressão, da função \texttt{construir\_motor\_de\_identificacao} do Módulo 2:
@@ -499,13 +507,16 @@ compression::CompressionRouter construir_motor_de_recomendacao() {
     roteador.register_strategy(Console::GameCube,
         std::make_shared<compression::converters::DolphinToolConverter>());
 
+    // Console::PSP (.iso cru) vai para o maxcso -- Console::PSP_PBP NUNCA
+    // e' registrado aqui, propositalmente (ver CaixaAlerta acima).
     roteador.register_strategy(Console::PSP,
         std::make_shared<compression::converters::MaxcsoConverter>());
 
-    // Note: Console::DreamcastModificado NUNCA e' registrado aqui --
-    // e nem precisaria ser, ja que rotear() o bloqueia antes de
-    // consultar o mapa. A ausencia de registro e' redundante com a
-    // trava explicita, e essa redundancia e' proposital.
+    // Note: nem Console::DreamcastModificado nem Console::PSP_PBP sao
+    // registrados aqui -- e nenhum dos dois precisaria ser, ja que
+    // rotear() os bloqueia antes de consultar o mapa. A ausencia de
+    // registro e' redundante com a trava explicita, e essa redundancia
+    // e' proposital para os DOIS valores sentinela do projeto.
     return roteador;
 }
 \end{CaixaCodigo}
@@ -519,18 +530,17 @@ Isso evita alocar objetos idênticos sem necessidade -- outro pequeno ganho que 
 
 Se você conferir a montagem acima com atenção, vai notar algo importante: \textbf{nenhuma linha registra \texttt{LibzipPacker} no roteador}.
 Isso não é um esquecimento -- é uma consequência honesta do estado atual do projeto.
-A documentação v2.0 promete suporte a cartuchos e Arcade (\texttt{.sfc}, \texttt{.md}, coleções), mas o Módulo 2 \textbf{ainda não implementou} nenhum detector para esses formatos -- não existe, hoje, nenhum valor no \texttt{enum class Console} que represente ``cartucho de SNES'' ou ``coleção de Arcade''.
+A documentação v2.0 promete suporte a cartuchos e Arcade (\texttt{.sfc}, \texttt{.md}, coleções), mas o Módulo 2 \textbf{ainda não implementou} nenhum detector para esses formatos -- não existe, hoje, nenhum valor no \texttt{enum class Console} que represente ``cartucho de SNES'' ou ``coleção de Arcade'' com um detector associado (\texttt{Console::SNES} e \texttt{Console::MegaDrive} já existem no enum desde o Módulo 2, mas ainda sem nenhum \texttt{IConsoleDetector} ou \texttt{IContainerDetector} concreto que os produza).
 
 \begin{CaixaAlerta}
-Isto é o Princípio Aberto/Fechado sendo exercitado em sua forma mais literal: \texttt{LibzipPacker} já está \textbf{pronto, testável e funcional} (Exercício 3.3), esperando por um valor de \texttt{Console} e um detector correspondente que ainda não existem.
-Quando a comunidade (Módulo 14) ou um módulo futuro de revisão do Motor de Identificação adicionar, por exemplo, \texttt{Console::CartuchoOuArcade} e um \texttt{SfcExtensionDetector}, a \textbf{única} linha nova necessária em todo este módulo será um \texttt{roteador.register\_strategy(Console::CartuchoOuArcade, std::make\_shared<LibzipPacker>());} -- nenhuma classe já escrita aqui precisará ser reaberta.
-Preferimos deixar essa lacuna explícita, documentada e discutida (Exercício 3.5), a inventar um valor de enum neste módulo só para ``fechar a tabela'' artificialmente -- isso seria projetar sobre um detector que ainda não existe, invertendo a ordem correta de dependências do projeto (identificação vem antes de roteamento).
+Isto é o Princípio Aberto/Fechado sendo exercitado em sua forma mais literal: \texttt{LibzipPacker} já está \textbf{pronto, testável e funcional} (Exercício 3.3), esperando por um detector correspondente que ainda não existe. Quando um módulo futuro de revisão do Motor de Identificação adicionar, por exemplo, um \texttt{SfcExtensionDetector} que produza \texttt{Console::SNES}, a \textbf{única} linha nova necessária em todo este módulo será um \texttt{roteador.register\_strategy(Console::SNES, std::make\_shared<LibzipPacker>());} -- nenhuma classe já escrita aqui precisará ser reaberta.
+Preferimos deixar essa lacuna explícita, documentada e discutida (Exercício 3.5), a inventar um detector neste módulo só para ``fechar a tabela'' artificialmente -- isso seria projetar sobre uma peça do Motor de Identificação que ainda não existe, invertendo a ordem correta de dependências do projeto (identificação vem antes de roteamento).
 \end{CaixaAlerta}
 
 \subsection{Arquitetura de Pastas: o que este módulo acrescenta}
 
 O Módulo 0 já havia reservado o terreno (``cada subpasta corresponde a uma área de responsabilidade'');
-este módulo é a primeira vez que uma \textbf{pasta inteiramente nova} nasce sob \texttt{core/}, ao lado de \texttt{io/}, \texttt{process/}, \texttt{identification/} e \texttt{models/}:
+este módulo é a primeira vez que uma \textbf{pasta inteiramente nova} nasce sob \texttt{core/}, ao lado de \texttt{io/}, \texttt{process/}, \texttt{identification/}, \texttt{models/} e \texttt{bootstrap/} (esta última já introduzida pelo Módulo 2):
 
 \begin{CaixaArvore}
 core/
@@ -538,6 +548,7 @@ core/
 |   |-- io/                              [Modulo 0, sem alteracoes]
 |   |-- process/                         [Modulo 0, reaproveitado neste modulo]
 |   |-- identification/                  [Modulo 0 e 2, sem alteracoes neste modulo]
+|   |-- bootstrap/                       [Modulo 2, sem alteracoes neste modulo]
 |   |-- models/                          [Modulo 0/2, sem alteracoes neste modulo --
 |   |                                      Console.hpp ja unificado desde o Modulo 0]
 |   `-- compression/                     [NOVO neste modulo]
@@ -552,7 +563,7 @@ core/
     |-- models/
     |   `-- ConversionJob.cpp            [Modulo 0, sem alteracoes de logica]
     `-- compression/                     [NOVO neste modulo]
-        |-- CompressionRouter.cpp        [NOVO]
+        |-- CompressionRouter.cpp        [NOVO -- ver CaixaAlerta sobre PSP_PBP]
         `-- converters/
             |-- ChdmanConverter.cpp      [NOVO]
             |-- DolphinToolConverter.cpp [NOVO]
@@ -567,7 +578,7 @@ A única linha de build genuinamente pendente é a que resolve a dependência de
 
 \subsection{Onde o projeto está agora, de fato}
 
-Vale fechar este módulo com um retrato honesto do estado do repositório \texttt{Dev-Sams1012/RetroForge} no momento em que este texto foi escrito: a raiz ainda contém exatamente \texttt{.github/workflows/}, \texttt{cli/}, \texttt{core/}, \texttt{external/}, além dos arquivos de configuração (\texttt{CMakeLists.txt}, \texttt{.gitmodules}, \texttt{.clang-format}, \texttt{.clangd}, \texttt{.gitignore}) já dissecados nos Módulos 0 e 1. Ou seja: tudo o que este Módulo 3 descreveu -- \texttt{compression/}, os quatro conversores e o \texttt{CompressionRouter} -- ainda \textbf{não foi commitado}.
+Vale fechar este módulo com um retrato honesto do estado do repositório \texttt{Dev-Sams1012/RetroForge} no momento em que este texto foi escrito: a raiz contém \texttt{.github/workflows/}, \texttt{cli/}, \texttt{core/} (já com \texttt{identification/} e \texttt{bootstrap/} completos do Módulo 2), \texttt{external/}, além dos arquivos de configuração (\texttt{CMakeLists.txt}, \texttt{.gitmodules}, \texttt{.clang-format}, \texttt{.clangd}, \texttt{.gitignore}) já dissecados nos Módulos 0 e 1. Ou seja: tudo o que este Módulo 3 descreveu -- \texttt{compression/}, os quatro conversores e o \texttt{CompressionRouter} com a trava dupla -- ainda \textbf{não foi commitado}.
 Isso é esperado e intencional: este ``livro'' funciona como um roteiro de implementação incremental, e o repositório real avança módulo a módulo, na mesma ordem em que este texto é escrito.
 Ao terminar os exercícios deste módulo, o próximo passo prático (fora do livro) é abrir um Pull Request que adicione exatamente essas pastas e classes ao repositório, mantendo o CI (Módulo 1) verde -- \texttt{clang-format --dry-run --Werror} incluso.
 
@@ -579,19 +590,19 @@ Lembrete das etiquetas: \textbf{[projeto]} = vira arquivo/pasta permanente do re
 
 \begin{enumerate}[label=\textbf{3.\arabic*}]
     \item \textbf{[projeto]} Implemente \texttt{MaxcsoConverter.hpp}/\texttt{.cpp} seguindo exatamente o molde de \texttt{ChdmanConverter}, montando o comando \texttt{maxcso "origem" -o "destino"} e retornando \texttt{".cso"} em \texttt{extensao\_saida()}.
-Registre-a no \texttt{CompressionRouter} para \texttt{Console::PSP}.
-    \item \textbf{[laboratório]} Sem rodar um jogo real: crie um \texttt{main()} temporário que monte o \texttt{CompressionRouter} completo, construa manualmente três \texttt{ConversionJob} fictícios (\texttt{Console::PS2}, \texttt{Console::GameCube}, \texttt{Console::DreamcastModificado} -- apontando para caminhos que nem precisam existir de verdade) e confirme, olhando apenas o valor de \texttt{ResultadoRoteamento} devolvido, que o terceiro é bloqueado \textbf{antes} de qualquer tentativa de chamar um subprocesso.
+Registre-a no \texttt{CompressionRouter} para \texttt{Console::PSP} -- \textbf{nunca} para \texttt{Console::PSP\_PBP}.
+    \item \textbf{[laboratório]} Sem rodar um jogo real: crie um \texttt{main()} temporário que monte o \texttt{CompressionRouter} completo, construa manualmente quatro \texttt{ConversionJob} fictícios (\texttt{Console::PS2}, \texttt{Console::GameCube}, \texttt{Console::DreamcastModificado} e \texttt{Console::PSP\_PBP} -- apontando para caminhos que nem precisam existir de verdade) e confirme, olhando apenas o valor de \texttt{ResultadoRoteamento} devolvido, que o terceiro \textbf{e} o quarto são bloqueados \textbf{antes} de qualquer tentativa de chamar um subprocesso.
 Este \texttt{main()} é descartável -- será formalizado como teste automatizado de verdade no Módulo 12.
     \item \textbf{[projeto]} Implemente \texttt{LibzipPacker.hpp}/\texttt{.cpp} conforme apresentado nesta seção.
 Mesmo sem nenhuma rota registrada ainda no \texttt{CompressionRouter} (Seção 3.7), escreva um pequeno teste manual que chame \texttt{LibzipPacker::comprimir} diretamente sobre um \texttt{ConversionJob} fictício apontando para um arquivo de texto qualquer, e confirme que um \texttt{.zip} válido é gerado ao final.
 A classe é entregável permanente; o teste manual de confirmação é descartável.
     \item \textbf{[laboratório]} Escreva um pequeno arquivo de verificação (não precisa virar parte permanente do build) contendo apenas \texttt{static\_assert(std::is\_same\_v<retroforge::models::Console, retroforge::identification::Console>, "...")}\texttt{;}.
 Confirme que ele compila sem erro, e explique em poucas frases por que isso prova que \texttt{CompressionRouter} (que usa \texttt{models::Console}) e \texttt{ConsoleIdentifier} (que devolve \texttt{identification::Console}) nunca podem divergir silenciosamente -- a unificação feita no Módulo 0 (\texttt{models/Console.hpp} como única fonte de verdade) é o que torna essa prova trivial.
-    \item \textbf{[laboratório]} Discuta por escrito (não precisa codificar): que novo valor de \texttt{enum class Console} e que novo(s) detector(es) de contêiner (Módulo 2) seriam necessários para que \texttt{LibzipPacker} finalmente ganhe uma rota registrada no \texttt{CompressionRouter} para cartuchos de SNES (\texttt{.sfc}) e Mega Drive (\texttt{.md})?
+    \item \textbf{[laboratório]} Discuta por escrito (não precisa codificar): que novo(s) detector(es) de contêiner (Módulo 2) seriam necessários para que \texttt{LibzipPacker} finalmente ganhe uma rota registrada no \texttt{CompressionRouter} para os valores \texttt{Console::SNES} e \texttt{Console::MegaDrive}, que já existem no enum mas ainda não têm detector?
 Uma única classe de detector bastaria para os dois formatos, ou o Princípio da Responsabilidade Única sugere duas classes distintas, como \texttt{DreamcastGdiDetector} e \texttt{DreamcastCdiDetector} fizeram no Módulo 2?
 É uma reflexão escrita -- guarde a resposta para quando o Motor de Identificação for revisitado.
     \item \textbf{[laboratório]} Compare, com um pequeno teste manual, o comportamento de \texttt{CompressionRouter::rotear} quando um \texttt{ConversionJob} é criado com \texttt{Console::Desconhecido} (o valor que \texttt{ConsoleIdentifier::identify} devolve quando nenhum detector reconhece o arquivo, Módulo 2).
-Confirme que o resultado é \texttt{ResultadoRoteamento::ConsoleNaoSuportado}, e não um bloqueio de segurança -- são duas situações semanticamente diferentes (``não sei o que é isso'' vs.\ ``sei o que é isso e é perigoso''), e vale confirmar que o código realmente distingue as duas.
+Confirme que o resultado é \texttt{ResultadoRoteamento::ConsoleNaoSuportado}, e não um bloqueio de segurança -- são três situações semanticamente diferentes agora (``não sei o que é isso'' vs.\ ``sei o que é isso e é perigoso'' vs.\ ``sei o que é isso e é seguro''), e vale confirmar que o código realmente distingue todas elas, inclusive entre os dois casos de bloqueio (\texttt{DreamcastModificado} e \texttt{PSP\_PBP}).
 \end{enumerate}
 \end{CaixaDesafio}
 
@@ -601,11 +612,11 @@ Neste módulo você aprendeu:
     \item Por que o roteamento de compressão (Smart Context) merece ser uma classe própria, separada tanto da identificação (Módulo 2) quanto da apresentação (\texttt{cli/}/\texttt{gui/}) -- Responsabilidade Única aplicada à orquestração, não só às classes de dados.
     \item Como uma única interface (\texttt{ICompressionStrategy}) pode, corretamente, unificar duas naturezas de integração completamente diferentes -- subprocesso (\texttt{chdman}, \texttt{maxcso}, \texttt{dolphin-tool}) e biblioteca estática (\texttt{libzip}) -- porque o contrato observável é idêntico, mesmo com mecanismos internos radicalmente distintos.
     \item Como reaproveitar, sem alterar, duas classes do Módulo 0 (\texttt{process::ExternalProcessHandle} e o \texttt{shared\_ptr<ConversionJob>}) em um contexto totalmente novo -- a prova prática de que investir em RAII e posse bem definida logo no início do projeto paga dividendos em módulos futuros.
-    \item Por que valeu a pena, lá no Módulo 0 e expandido no Módulo 2, extrair o \texttt{enum class Console} para seu próprio arquivo neutro (\texttt{models/Console.hpp}) em vez de declará-lo em dependências isoladas: \texttt{compression/} pôde incluir apenas o tipo de que precisa para mapear rotas incluindo \texttt{SegaCD}, \texttt{Saturn} e a trava \texttt{DreamcastModificado}, sem se acoplar à interface de identificação inteira.
-    \item Como implementar a trava de segurança da US06 como um \texttt{if} explícito e antecipado, em vez de depender apenas da ausência de registro no mapa de estratégias -- fechando a mesma porta que motivou o projeto inteiro (Motivação e História do Projeto).
+    \item Por que valeu a pena, lá no Módulo 0 e expandido no Módulo 2, extrair o \texttt{enum class Console} para seu próprio arquivo neutro (\texttt{models/Console.hpp}) em vez de declará-lo em dependências isoladas: \texttt{compression/} pôde incluir apenas o tipo de que precisa para mapear rotas incluindo \texttt{SegaCD}, \texttt{Saturn} e as duas travas de segurança, sem se acoplar à interface de identificação inteira.
+    \item Que \texttt{Console::DreamcastModificado} e \texttt{Console::PSP\_PBP} são, arquiteturalmente, o \textbf{mesmo tipo de problema} -- e por que a correção deste módulo foi estender a trava explícita e antecipada, verificada antes do \texttt{unordered\_map}, para cobrir \textbf{ambos} os valores sentinela, em vez de depender apenas da ausência de registro no mapa de estratégias.
     \item Que uma estratégia de compressão pode estar 100\% implementada e testável (\texttt{LibzipPacker}) mesmo antes de qualquer detector de console alimentá-la -- e por que isso é uma consequência saudável do Princípio Aberto/Fechado, não uma lacuna a ser preenchida às pressas.
 \end{itemize}
 
-Com o console identificado \textbf{e} roteado para a ferramenta certa, falta resolver um problema que a documentação (Seção 3.4) já anunciou desde o início: converter 50 jogos, um de cada vez, de forma sequencial, é lento e desperdiça os múltiplos núcleos de qualquer máquina moderna.
-O Módulo 4 vai introduzir o Thread Pool customizado do RetroForge -- e é exatamente o \texttt{CompressionRouter} deste módulo que cada \textit{worker} da piscina de threads vai chamar, em paralelo, para múltiplos \texttt{ConversionJob} simultâneos.
+Com o console identificado \textbf{e} roteado com segurança para a ferramenta certa (ou explicitamente bloqueado, nos dois casos sentinela), falta resolver um problema que a documentação (Seção 3.4) já anunciou desde o início: converter 50 jogos, um de cada vez, de forma sequencial, é lento e desperdiça os múltiplos núcleos de qualquer máquina moderna.
+O Módulo 4 vai introduzir o Thread Pool customizado do RetroForge -- e é exatamente o \texttt{CompressionRouter} deste módulo, já com sua trava dupla, que cada \textit{worker} da piscina de threads vai chamar, em paralelo, para múltiplos \texttt{ConversionJob} simultâneos.
 \end{CaixaResumo}

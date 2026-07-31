@@ -1,9 +1,11 @@
 \section{Módulo 4: Assincronismo e Alta Performance (Thread Pool \& Batching)}
 
-O Módulo 3 terminou com uma peça que sabe fazer exatamente uma coisa bem feita: dado um único \texttt{ConversionJob} já identificado, o \texttt{CompressionRouter} decide a ferramenta certa e produz o arquivo comprimido. Mas as \textit{User Stories} da documentação nunca falam de ``um jogo'' -- falam de ``50 jogos'' (US03), de ``um HD inteiro'' (US08), de cancelar \textbf{um} jogo problemático sem derrubar a fila (US05), e de continuar rodando em segundo plano sem travar a máquina do usuário (US04). Chamar \texttt{CompressionRouter::rotear} 50 vezes, sequencialmente, dentro de um \texttt{for}, resolveria a conversão -- mas ignoraria completamente os múltiplos núcleos de qualquer CPU moderna, e não daria ao usuário nenhum controle granular sobre a fila em andamento. Este módulo resolve isso: vamos construir a Thread Pool customizada do RetroForge, o gerenciador de lote que a documentação chama de ``fila inteligente'', e o mecanismo de \textit{Auto-Throttle} que protege a máquina do usuário.
+O Módulo 3 terminou com uma peça que sabe fazer exatamente uma coisa bem feita: dado um único \texttt{ConversionJob} já identificado, o \texttt{CompressionRouter} decide a ferramenta certa e produz o arquivo comprimido -- ou bloqueia explicitamente a execução, nos dois casos sentinela do vocabulário (\texttt{Console::DreamcastModificado} e \texttt{Console::PSP\_PBP}). Mas as \textit{User Stories} da documentação nunca falam de ``um jogo'' -- falam de ``50 jogos'' (US03), de ``um HD inteiro'' (US08), de cancelar \textbf{um} jogo problemático sem derrubar a fila (US05), e de continuar rodando em segundo plano sem travar a máquina do usuário (US04). Chamar \texttt{CompressionRouter::rotear} 50 vezes, sequencialmente, dentro de um \texttt{for}, resolveria a conversão -- mas ignoraria completamente os múltiplos núcleos de qualquer CPU moderna, e não daria ao usuário nenhum controle granular sobre a fila em andamento. Este módulo resolve isso: vamos construir a Thread Pool customizada do RetroForge, o gerenciador de lote que a documentação chama de ``fila inteligente'', e o mecanismo de \textit{Auto-Throttle} que protege a máquina do usuário.
 
 \begin{CaixaInfo}[title={O que já existe vs. o que este módulo constrói}]
-Dos Módulos 0 a 3, já temos prontos: \texttt{models::Console} e \texttt{models::ConversionJob} (cujos campos \texttt{progresso\_} e \texttt{cancelado\_} já são \texttt{std::atomic} desde o Módulo 0 -- uma decisão que só vai mostrar todo o seu valor agora, quando múltiplas threads passarem a interagir com o mesmo \texttt{ConversionJob}), \texttt{ConsoleIdentifier} e \texttt{CompressionRouter}. No repositório público (\texttt{github.com/Dev-Sams1012/RetroForge}), nada mudou desde o retrato feito ao final do Módulo 3: ainda não existe nenhuma pasta de concorrência, nem qualquer gerenciamento de lote. Este módulo cria duas pastas novas -- \texttt{concurrency/} (a \texttt{ThreadPool} genérica, o monitoramento de CPU e o controlador de \textit{throttle}) e \texttt{batch/} (o \texttt{BatchConversionManager}, que amarra a \texttt{ThreadPool} ao \texttt{CompressionRouter} do Módulo 3) -- e deixa \textbf{fora} de escopo, deliberadamente, a varredura recursiva de diretórios: montar a lista real de 50 jogos a partir de uma pasta do HD é responsabilidade do \texttt{std::filesystem::recursive\_directory\_iterator}, que só será formalizado no Módulo 7. Aqui, os jobs chegam prontos (de uma lista, de um teste manual, ou futuramente do CLI) -- o que este módulo resolve é \textbf{como processá-los em paralelo, com segurança}.
+Dos Módulos 0 a 3, já temos prontos: \texttt{models::Console} (incluindo os dois valores sentinela do Módulo 2) e \texttt{models::ConversionJob} (cujos campos \texttt{progresso\_} e \texttt{cancelado\_} já são \texttt{std::atomic} desde o Módulo 0 -- uma decisão que só vai mostrar todo o seu valor agora, quando múltiplas threads passarem a interagir com o mesmo \texttt{ConversionJob}), \texttt{ConsoleIdentifier} e \texttt{CompressionRouter} -- este último já com a trava explícita que bloqueia \textbf{tanto} \texttt{DreamcastModificado} \textbf{quanto} \texttt{PSP\_PBP} (Módulo 3, corrigido). Esse detalhe importa aqui: o \texttt{BatchConversionManager} que este módulo constrói vai chamar \texttt{CompressionRouter::rotear} para cada job, cegamente, dentro da Thread Pool -- ele só pode se dar ao luxo de não saber nada sobre consoles porque confia que o roteador já resolve as duas travas de segurança sozinho, antes de qualquer subprocesso ser aberto.
+
+No repositório público (\texttt{github.com/Dev-Sams1012/RetroForge}), nada mudou desde o retrato feito ao final do Módulo 3: ainda não existe nenhuma pasta de concorrência, nem qualquer gerenciamento de lote. Este módulo cria duas pastas novas -- \texttt{concurrency/} (a \texttt{ThreadPool} genérica, o monitoramento de CPU e o controlador de \textit{throttle}) e \texttt{batch/} (o \texttt{BatchConversionManager}, que amarra a \texttt{ThreadPool} ao \texttt{CompressionRouter} do Módulo 3) -- e deixa \textbf{fora} de escopo, deliberadamente, a varredura recursiva de diretórios: montar a lista real de 50 jogos a partir de uma pasta do HD é responsabilidade do \texttt{std::filesystem::recursive\_directory\_iterator}, que só será formalizado no Módulo 7. Aqui, os jobs chegam prontos (de uma lista, de um teste manual, ou futuramente do CLI) -- o que este módulo resolve é \textbf{como processá-los em paralelo, com segurança}.
 \end{CaixaInfo}
 
 \subsection{O problema com ``um subprocesso por jogo''}
@@ -200,7 +202,7 @@ Com a \texttt{ThreadPool} pronta, falta a classe que sabe traduzir ``processar e
 
 \begin{itemize}
     \item \textbf{Por que \texttt{BatchConversionManager} existe:} é a única classe que sabe que ``processar um lote'' significa ``para cada \texttt{ConversionJob}, enfileirar uma tarefa que chama \texttt{CompressionRouter::rotear}''. Nem a \texttt{ThreadPool} (que não sabe o que é um console) nem o \texttt{CompressionRouter} (que não sabe que existe uma fila) têm essa responsabilidade -- ela pertence exclusivamente a esta classe.
-    \item \textbf{Como se comunica com outras classes:} depende de \texttt{compression::CompressionRouter} (por referência -- não é dona dele; o \texttt{CompressionRouter} é montado uma única vez, fora daqui, como já vimos no Módulo 3) e possui, por composição, sua própria \texttt{concurrency::ThreadPool}. É consumida pela camada de apresentação (\texttt{cli/}, e futuramente \texttt{gui/}), que é quem efetivamente chama \texttt{adicionar\_job} para cada arquivo encontrado (Módulo 7) e \texttt{cancelar\_job} quando o usuário pede.
+    \item \textbf{Como se comunica com outras classes:} depende de \texttt{compression::CompressionRouter} (por referência -- não é dona dele; o \texttt{CompressionRouter} é montado uma única vez, fora daqui, como já vimos no Módulo 3, já com sua trava dupla contra \texttt{DreamcastModificado} e \texttt{PSP\_PBP}) e possui, por composição, sua própria \texttt{concurrency::ThreadPool}. É consumida pela camada de apresentação (\texttt{cli/}, e futuramente \texttt{gui/}), que é quem efetivamente chama \texttt{adicionar\_job} para cada arquivo encontrado (Módulo 7) e \texttt{cancelar\_job} quando o usuário pede.
     \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/batch/BatchConversionManager.hpp} e \texttt{core/src/batch/BatchConversionManager.cpp} -- uma segunda pasta nova, \texttt{batch/}, que representa a área de responsabilidade ``orquestração de lote'', distinta tanto de \texttt{concurrency/} (mecanismo genérico) quanto de \texttt{compression/} (regra de roteamento).
 \end{itemize}
 
@@ -223,7 +225,9 @@ namespace retroforge::batch {
 
 // Orquestra o processamento em lote (US03/US08): recebe jobs, os enfileira
 // na ThreadPool, e delega a compressao de cada um ao CompressionRouter
-// (Modulo 3) -- sem duplicar nenhuma regra de roteamento aqui.
+// (Modulo 3) -- sem duplicar nenhuma regra de roteamento aqui, e sem
+// reimplementar nenhuma das duas travas de seguranca (DreamcastModificado,
+// PSP_PBP) que ja vivem exclusivamente dentro de CompressionRouter::rotear.
 class BatchConversionManager {
 public:
     // 'monitor_cpu' e' opcional (nullptr por padrao = sem Auto-Throttle).
@@ -291,7 +295,10 @@ void BatchConversionManager::adicionar_job(std::shared_ptr<models::ConversionJob
         // o Modulo 9 (Tratamento de Erros e Logs Thread-Safe) vai
         // formalizar COMO esse resultado e' registrado com seguranca a
         // partir de multiplas threads -- este modulo foca em concorrencia,
-        // nao em observabilidade.
+        // nao em observabilidade. Isso vale igualmente para os casos de
+        // sucesso, de ConsoleNaoSuportado e para os dois casos de
+        // BloqueadoPorSeguranca (DreamcastModificado e PSP_PBP) -- todos
+        // fluem pelo mesmo caminho, ja resolvidos dentro do roteador.
     });
 }
 
@@ -313,7 +320,7 @@ void BatchConversionManager::aguardar_conclusao() {
 \end{CaixaCodigo}
 
 \begin{CaixaAlerta}
-\texttt{BatchConversionManager} guarda \texttt{compression::CompressionRouter\&} por \textbf{referência}, não por valor nem por \texttt{shared\_ptr}. Isso impõe um contrato implícito, mas importante: todas as chamadas a \texttt{register\_strategy} (Módulo 3) devem acontecer \textbf{antes} de qualquer \texttt{adicionar\_job}, e nenhuma nova estratégia deve ser registrada depois que o processamento em lote começar. \texttt{std::unordered\_map::find} (usado dentro de \texttt{rotear}) é seguro para leitura concorrente de múltiplas threads, mas \textbf{não} é seguro se outra thread estiver simultaneamente inserindo uma nova entrada -- exatamente o que \texttt{register\_strategy} faria. Na prática, isso significa: monte o \texttt{CompressionRouter} inteiro primeiro (como no Módulo 3), depois construa o \texttt{BatchConversionManager} -- nunca o contrário.
+\texttt{BatchConversionManager} guarda \texttt{compression::CompressionRouter\&} por \textbf{referência}, não por valor nem por \texttt{shared\_ptr}. Isso impõe um contrato implícito, mas importante: todas as chamadas a \texttt{register\_strategy} (Módulo 3) devem acontecer \textbf{antes} de qualquer \texttt{adicionar\_job}, e nenhuma nova estratégia deve ser registrada depois que o processamento em lote começar. \texttt{std::unordered\_map::find} (usado dentro de \texttt{rotear}) é seguro para leitura concorrente de múltiplas threads, mas \textbf{não} é seguro se outra thread estiver simultaneamente inserindo uma nova entrada -- exatamente o que \texttt{register\_strategy} faria. Na prática, isso significa: monte o \texttt{CompressionRouter} inteiro primeiro (como no Módulo 3, incluindo a montagem completa em \texttt{construir\_motor\_de\_recomendacao()}), depois construa o \texttt{BatchConversionManager} -- nunca o contrário. Vale notar que a trava de segurança contra \texttt{DreamcastModificado}/\texttt{PSP\_PBP} não depende dessa ordem -- ela é verificada dentro de \texttt{rotear()} antes de qualquer acesso ao \texttt{unordered\_map} -- mas as rotas \textit{registradas} sim.
 \end{CaixaAlerta}
 
 \subsection{Auto-Throttle: \texttt{ICpuMonitor} e o limite de 95\% (US04)}
@@ -556,7 +563,10 @@ Juntando as três peças deste módulo com o \texttt{CompressionRouter} do Módu
 using namespace retroforge;
 
 int main() {
-    auto roteador = construir_motor_de_recomendacao(); // Modulo 3
+    auto roteador = construir_motor_de_recomendacao(); // Modulo 3 -- ja com a
+                                                         // trava dupla contra
+                                                         // DreamcastModificado
+                                                         // e PSP_PBP
 
     auto monitor_cpu = std::make_shared<concurrency::monitors::LinuxProcStatCpuMonitor>();
 
@@ -572,6 +582,9 @@ int main() {
         "/mnt/hd_externo/GameCube/Jogo2.iso", models::Console::GameCube));
     // ... mais 48 jobs viriam aqui, tipicamente de uma varredura recursiva
     // real de diretorio (Modulo 7), nao de chamadas manuais como esta.
+    // Um job ficticio com Console::PSP_PBP ou Console::DreamcastModificado
+    // que aparecesse aqui seria automaticamente bloqueado por rotear() --
+    // nao ha nada que o BatchConversionManager precise fazer a respeito.
 
     // Usuario percebeu um problema no Jogo2 e cancela so ele (US05):
     gerenciador.cancelar_job("/mnt/hd_externo/GameCube/Jogo2.iso");
@@ -595,8 +608,10 @@ core/
 |   |-- io/                              [Modulo 0, sem alteracoes]
 |   |-- process/                         [Modulo 0, sem alteracoes]
 |   |-- identification/                  [Modulo 0 e 2, sem alteracoes]
+|   |-- bootstrap/                       [Modulo 2, sem alteracoes]
 |   |-- models/                          [Modulo 0/2, sem alteracoes]
-|   |-- compression/                     [Modulo 3, sem alteracoes]
+|   |-- compression/                     [Modulo 3, sem alteracoes neste modulo --
+|   |                                      trava dupla ja corrigida no Modulo 3]
 |   |-- concurrency/                     [NOVO neste modulo]
 |   |   |-- ThreadPool.hpp               [NOVO]
 |   |   |-- ICpuMonitor.hpp              [NOVO]
@@ -648,8 +663,8 @@ Lembrete das etiquetas: \textbf{[projeto]} = vira arquivo/pasta permanente do re
 
 \begin{enumerate}[label=\textbf{4.\arabic*}]
     \item \textbf{[laboratório]} Escreva um \texttt{main()} temporário que crie uma \texttt{ThreadPool} com 2 threads e enfileire 10 tarefas simples (cada uma apenas imprimindo seu próprio número e dormindo 100ms com \texttt{std::this\_thread::sleep\_for}). Confirme, pela ordem e pelo tempo total de execução, que no máximo 2 tarefas rodam simultaneamente, e que \texttt{aguardar\_ociosidade()} só retorna depois que as 10 terminaram. Este \texttt{main()} é descartável -- será formalizado como teste automatizado de verdade no Módulo 12.
-    \item \textbf{[projeto]} Implemente \texttt{PspDetector}... \textit{(nota: caso ainda não tenha feito o Exercício 2.1/3.1 de módulos anteriores, este é um bom momento para revisitá-los antes de prosseguir -- o \texttt{BatchConversionManager} deste módulo já pressupõe um \texttt{CompressionRouter} totalmente montado, incluindo a rota de PSP).}
-    \item \textbf{[projeto]} Implemente \texttt{BatchConversionManager} e \texttt{ThreadPool} exatamente como apresentados nesta seção, e escreva um pequeno programa de demonstração que monte o \texttt{CompressionRouter} completo (Módulo 3), adicione 5 \texttt{ConversionJob} fictícios (apontando para arquivos que nem precisam existir de verdade, já que os conversores vão falhar graciosamente ao tentar abri-los -- Módulo 3, \texttt{try/catch} em \texttt{ChdmanConverter}) e confirme que \texttt{aguardar\_conclusao()} retorna depois que todos os 5 tiverem sido processados (com sucesso ou falha).
+    \item \textbf{[laboratório]} Antes de prosseguir, confirme que seu \texttt{CompressionRouter} (Módulo 3) já bloqueia \textbf{explicitamente} tanto \texttt{Console::DreamcastModificado} quanto \texttt{Console::PSP\_PBP} -- monte três \texttt{ConversionJob} fictícios com esses dois valores mais um \texttt{Console::PSP} normal, chame \texttt{rotear()} diretamente (sem passar pela Thread Pool ainda) e confirme os três resultados. O \texttt{BatchConversionManager} deste módulo pressupõe essa trava dupla já funcionando -- se ela estiver incompleta, jobs perigosos poderiam ser processados em paralelo dentro da fila, silenciosamente.
+    \item \textbf{[projeto]} Implemente \texttt{BatchConversionManager} e \texttt{ThreadPool} exatamente como apresentados nesta seção, e escreva um pequeno programa de demonstração que monte o \texttt{CompressionRouter} completo (Módulo 3), adicione 5 \texttt{ConversionJob} fictícios (apontando para arquivos que nem precisam existir de verdade, já que os conversores vão falhar graciosamente ao tentar abri-los -- Módulo 3, \texttt{try/catch} em \texttt{ChdmanConverter}) e confirme que \texttt{aguardar\_conclusao()} retorna depois que todos os 5 tiverem sido processados (com sucesso, bloqueio de segurança, ou falha).
     \item \textbf{[laboratório]} Usando o mesmo programa do exercício anterior, chame \texttt{cancelar\_job} para um dos 5 caminhos \textbf{antes} de chamar \texttt{aguardar\_conclusao()}, e confirme, inspecionando \texttt{job->foi\_cancelado()} depois, que o cancelamento cooperativo funcionou. Depois, discuta por escrito (não precisa codificar): em que cenário exatamente esse cancelamento cooperativo \textbf{não} seria suficiente na prática -- por exemplo, se o \texttt{chdman} estiver processando um arquivo de 4,7 GB e ainda não tiver produzido nenhuma linha de saída para o \texttt{ChdmanConverter} ler?
     \item \textbf{[laboratório]} Implemente \texttt{LinuxProcStatCpuMonitor} e escreva um pequeno \texttt{main()} que chame \texttt{uso\_percentual()} em um laço, a cada 500ms, durante 10 segundos, imprimindo o valor no terminal. Rode esse programa enquanto compila o próprio RetroForge em outro terminal (\texttt{cmake --build build -j}) e confirme que o percentual sobe visivelmente durante a compilação. O programa de demonstração é descartável.
     \item \textbf{[projeto]} Implemente \texttt{AutoThrottleController} conforme apresentado, e integre-o a um \texttt{BatchConversionManager} com um \texttt{limiar\_throttle\_percentual} propositalmente baixo (por exemplo, \texttt{5.0}) para forçar a pausa quase imediatamente em qualquer máquina real. Confirme, com prints de depuração temporários dentro de \texttt{loop\_monitoramento} (removidos depois), que a \texttt{ThreadPool} de fato pausa e retoma ao longo da execução, e que nenhuma tarefa enfileirada é perdida quando isso acontece.
@@ -663,10 +678,11 @@ Neste módulo você aprendeu:
     \item Que a decisão do Módulo 0 de tornar \texttt{progresso\_} e \texttt{cancelado\_} campos \texttt{std::atomic} dentro de \texttt{ConversionJob} paga dividendos diretos agora: múltiplas threads trabalhadoras e a thread principal (ou de monitoramento) podem ler e escrever esses campos com segurança, sem nenhum mutex adicional.
     \item Por que o cancelamento granular deste módulo é honestamente \textbf{cooperativo}, não um \texttt{SIGTERM} cirúrgico ao subprocesso -- e por que essa limitação vem diretamente de uma decisão já tomada no Módulo 0 (\texttt{popen} não expõe PID), a ser resolvida de verdade só no Módulo 8.
     \item Como separar uma peça de infraestrutura genérica e reutilizável (\texttt{concurrency::ThreadPool}, que não sabe nada sobre consoles) de uma peça de orquestração específica do domínio (\texttt{batch::BatchConversionManager}, que sabe traduzir jobs em tarefas) -- a mesma disciplina de Responsabilidade Única aplicada, desta vez, à concorrência.
+    \item Que o \texttt{BatchConversionManager} pode permanecer completamente ignorante sobre \texttt{DreamcastModificado} e \texttt{PSP\_PBP} -- ele simplesmente enfileira e chama \texttt{rotear()} -- \textbf{porque} a trava dupla de segurança já foi resolvida, de forma centralizada e antecipada, dentro do próprio \texttt{CompressionRouter} (Módulo 3). Concorrência e regras de segurança são responsabilidades ortogonais, e essa ortogonalidade só existe porque cada uma foi mantida na camada certa.
     \item Como \texttt{ICpuMonitor} isola a única parte deste módulo que é inerentemente específica de plataforma (leitura de \texttt{/proc/stat}), preparando o terreno para uma futura implementação Windows sem que \texttt{AutoThrottleController} precise mudar uma linha.
     \item Por que RAII (o destrutor de \texttt{AutoThrottleController} garantindo \texttt{retomar()} antes de encerrar) evita um \textit{deadlock} sutil -- uma \texttt{ThreadPool} pausada para sempre -- que só apareceria em produção, dificilmente em teste manual.
     \item Que uma linha de CMake (\texttt{Threads::Threads}) ainda precisa ser adicionada a \texttt{core/CMakeLists.txt} antes que este módulo compile de verdade em todas as plataformas do CI -- e onde exatamente ela deve entrar.
 \end{itemize}
 
-Com jobs sendo processados em paralelo, cancelados individualmente e pausados automaticamente sob carga de CPU, falta responder a uma pergunta que a interface do usuário vai fazer antes mesmo de qualquer conversão começar: ``quantos gigabytes eu vou economizar, e vale a pena buscar o nome oficial deste jogo online?''. O Módulo 5 vai introduzir a Estimativa Preditiva de Armazenamento e o Scraper Online de Metadados -- e, ao fazer isso, vai reaproveitar a \texttt{concurrency::ThreadPool} deste módulo para paralelizar o hashing de múltiplos arquivos ao mesmo tempo, exatamente como a Seção anterior já antecipou.
+Com jobs sendo processados em paralelo, cancelados individualmente, bloqueados com segurança quando perigosos, e pausados automaticamente sob carga de CPU, falta responder a uma pergunta que a interface do usuário vai fazer antes mesmo de qualquer conversão começar: ``quantos gigabytes eu vou economizar, e vale a pena buscar o nome oficial deste jogo online?''. O Módulo 5 vai introduzir a Estimativa Preditiva de Armazenamento e o Scraper Online de Metadados -- e, ao fazer isso, vai reaproveitar a \texttt{concurrency::ThreadPool} deste módulo para paralelizar o hashing de múltiplos arquivos ao mesmo tempo, exatamente como a Seção anterior já antecipou.
 \end{CaixaResumo}
