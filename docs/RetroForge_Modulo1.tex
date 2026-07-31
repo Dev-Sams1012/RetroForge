@@ -1,0 +1,375 @@
+\section{Módulo 1: O Fantasma do CMake (Desmistificando o Build)}
+
+No Módulo 0 construímos a fundação teórica do RetroForge: princípios SOLID, a separação entre \texttt{include/} e \texttt{src/}, RAII, smart pointers e as primeiras classes reais do projeto (\texttt{BinaryFileReader}, \texttt{ExternalProcessHandle}, \texttt{ConversionJob}, \texttt{IConsoleDetector}, \texttt{ConsoleIdentifier}, \texttt{GameCubeDetector}). Mas nenhuma dessas classes compila sozinha. Alguém precisa dizer ao compilador: ``estes arquivos formam a biblioteca \texttt{core}, este outro arquivo forma o executável \texttt{cli}, e o \texttt{cli} depende do \texttt{core}''. Esse ``alguém'' é o CMake.
+
+Diferente do Módulo 0, este módulo não vai introduzir novas classes de regra de negócio -- ele introduz a \textbf{infraestrutura de build} que faz as classes do Módulo 0 (e de todos os módulos seguintes) se conectarem em um binário real. Ainda assim, vamos escrever pelo menos uma classe pequena e concreta (\texttt{BuildInfo}) para mostrar como o próprio CMake pode gerar código C++ automaticamente -- e vamos tomar, aqui, decisões formais de arquitetura de pastas que vão orientar onde cada artefato de build do projeto mora.
+
+\begin{CaixaInfo}[title={O que já existe vs. o que este módulo formaliza}]
+O repositório do RetroForge, no estado atual, já contém um esqueleto de build funcional -- não estamos partindo do zero. Já existem: um \texttt{CMakeLists.txt} raiz, um \texttt{core/CMakeLists.txt}, um \texttt{cli/CMakeLists.txt}, um \texttt{.gitmodules} apontando para a biblioteca \texttt{CLI11}, um \texttt{.clang-format}, um \texttt{.clangd} e um workflow de CI em \texttt{.github/workflows/}. Este módulo não vai reescrever esses arquivos do zero -- vai \textbf{dissecar linha por linha} o que já está lá, explicar por que cada decisão foi tomada, e então \textbf{expandir} essa base com o que ainda falta (geração de versão em tempo de compilação, e o mapeamento formal para as pastas \texttt{tests/}, \texttt{gui/} e o crescimento de \texttt{external/} que os módulos seguintes vão exigir).
+\end{CaixaInfo}
+
+\subsection{O que o CMake realmente faz (e por que ele não morde)}
+
+CMake não é um compilador. Ele é um \textbf{meta-gerador de sistemas de build}. Você escreve, em uma linguagem de script própria (arquivos \texttt{CMakeLists.txt}), uma descrição abstrata do seu projeto -- ``existe uma biblioteca chamada X, feita destes arquivos .cpp, que outro alvo Y depende dela'' -- e o CMake traduz essa descrição para o sistema de build nativo da máquina onde está rodando:
+
+\begin{itemize}
+    \item No Linux, ele normalmente gera um \texttt{Makefile} (ou arquivos \texttt{Ninja}, se você preferir o gerador \texttt{Ninja}, mais rápido).
+    \item No Windows, ele gera uma solução do Visual Studio (\texttt{.sln} + \texttt{.vcxproj}).
+    \item No macOS, ele pode gerar um projeto Xcode.
+\end{itemize}
+
+Essa é a razão de existir do CMake no RetroForge: o projeto precisa compilar de forma idêntica em Windows e Linux (Seção 2 da documentação de arquitetura), e ninguém no time -- nem futuros contribuidores da comunidade (Módulo 14) -- deveria precisar manter dois conjuntos de instruções de build manuais e divergentes.
+
+\begin{CaixaAlerta}
+Uma confusão comum de quem está começando: \textbf{CMake não compila nada sozinho}. Ele só \textit{gera} os arquivos que o \texttt{make}, o \texttt{ninja} ou o \texttt{MSBuild} vão usar para compilar de verdade. Por isso o fluxo de trabalho sempre tem duas etapas distintas: \texttt{cmake -B build} (configurar/gerar) e depois \texttt{cmake --build build} (efetivamente compilar). Confundir essas duas etapas é a causa mais comum de ``mensagens de erro estranhas do CMake'' para quem está começando.
+\end{CaixaAlerta}
+
+\subsection{Anatomia do \texttt{CMakeLists.txt} raiz do RetroForge}
+
+Este é o arquivo que já existe hoje na raiz do repositório. Vamos ler linha por linha:
+
+\begin{CaixaCodigo}
+cmake_minimum_required(VERSION 3.20)
+
+project(RetroForge
+    VERSION 0.1.0
+    LANGUAGES CXX
+)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_subdirectory(core)
+add_subdirectory(cli)
+# add_subdirectory(gui)
+\end{CaixaCodigo}
+
+\begin{itemize}
+    \item \texttt{cmake\_minimum\_required(VERSION 3.20)}: declara a versão mínima do próprio CMake exigida para interpretar este arquivo. \texttt{3.20} foi escolhida porque é a partir dela que recursos como \texttt{CONFIGURE\_DEPENDS} (usado no \texttt{file(GLOB\_RECURSE ...)}, ver adiante) e um suporte mais maduro a \texttt{FetchContent} (que vamos usar em módulos futuros para dependências sem submódulo Git) estão disponíveis com comportamento estável entre plataformas.
+    \item \texttt{project(RetroForge VERSION 0.1.0 LANGUAGES CXX)}: declara o nome do projeto, sua versão (que alimenta variáveis automáticas como \texttt{PROJECT\_VERSION\_MAJOR}, usadas na Seção~\ref{sec:buildinfo} deste módulo) e que só a linguagem C++ está envolvida (nenhum código C puro faz parte do build).
+    \item \texttt{CMAKE\_EXPORT\_COMPILE\_COMMANDS ON}: pede ao CMake para gerar, a cada configuração, um arquivo \texttt{compile\_commands.json} dentro da pasta de build. Esse arquivo é o que dá ao \texttt{clangd} (e, por consequência, ao Zed e a qualquer editor moderno) a capacidade de autocompletar, navegar definições e apontar erros exatamente como o compilador os veria -- vamos voltar a este ponto na Seção~\ref{sec:clangd}.
+    \item \texttt{CMAKE\_CXX\_STANDARD 20} + \texttt{CMAKE\_CXX\_STANDARD\_REQUIRED ON} + \texttt{CMAKE\_CXX\_EXTENSIONS OFF}: fixam C++20 como padrão obrigatório (o build falha, em vez de silenciosamente cair para um padrão mais antigo, se o compilador não suportar C++20) e desligam extensões proprietárias de compilador (como as extensões GNU do GCC), garantindo C++ \textbf{portável} entre GCC, Clang e MSVC -- essencial para a promessa de portabilidade cross-platform da documentação (Seção 2).
+    \item \texttt{add\_subdirectory(core)} e \texttt{add\_subdirectory(cli)}: dizem ao CMake para \textbf{entrar} nessas pastas e processar o \texttt{CMakeLists.txt} que existe dentro de cada uma delas. É assim que o projeto raiz ``enxerga'' os alvos (\textit{targets}) definidos em \texttt{core/} e \texttt{cli/} sem precisar redeclarar tudo em um único arquivo gigante.
+    \item \texttt{\# add\_subdirectory(gui)}: comentado de propósito. A pasta \texttt{gui/} ainda não existe porque a interface Dear ImGui só será construída no Módulo 11. Deixamos a linha já escrita e comentada como um \textbf{marcador de intenção} no próprio código -- qualquer pessoa lendo o \texttt{CMakeLists.txt} raiz hoje já sabe, sem precisar de documentação externa, que uma GUI está planejada e qual vai ser o nome da pasta.
+\end{itemize}
+
+\begin{CaixaInfo}
+Note como o \texttt{CMakeLists.txt} raiz \textbf{não sabe nada} sobre quais arquivos \texttt{.cpp} existem, quais bibliotecas externas o \texttt{core} usa, ou como o \texttt{cli} deve linkar contra o \texttt{core}. Essa é uma aplicação direta do mesmo espírito de Responsabilidade Única do Módulo 0, só que aplicado à \textbf{arquitetura de build}: o arquivo raiz só orquestra \textit{quais} subprojetos existem; cada subprojeto é dono das próprias regras de compilação.
+\end{CaixaInfo}
+
+\subsection{Alvos (\textit{Targets}): Biblioteca Estática vs. Executável}
+
+O CMake organiza tudo em torno do conceito de \textbf{target} -- uma unidade de build nomeada (uma biblioteca ou um executável) com suas próprias propriedades (arquivos-fonte, diretórios de include, dependências). O RetroForge já define dois:
+
+\begin{CaixaCodigo}
+# Arquivo: core/CMakeLists.txt
+file(GLOB_RECURSE CORE_SOURCES
+    CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+)
+
+add_library(retroforge_core STATIC
+    ${CORE_SOURCES}
+)
+
+target_include_directories(retroforge_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_include_directories(retroforge_core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_compile_features(retroforge_core PUBLIC cxx_std_20)
+\end{CaixaCodigo}
+
+\begin{itemize}
+    \item \texttt{add\_library(retroforge\_core STATIC ...)}: cria uma \textbf{biblioteca estática}. Isso significa que todo o código do Core (\texttt{BinaryFileReader}, \texttt{ConsoleIdentifier}, os futuros conversores do Módulo 3, o Thread Pool do Módulo 4, etc.) é compilado uma única vez em um arquivo \texttt{.a} (Linux) ou \texttt{.lib} (Windows), e esse arquivo é \textbf{embutido diretamente} dentro de qualquer executável que o linkar -- diferente de uma biblioteca \texttt{SHARED} (\texttt{.so}/\texttt{.dll}), que precisaria ser distribuída como um arquivo separado ao lado do executável.
+    \item \textbf{Por que estática e não compartilhada:} a documentação (Seção 2) e o Módulo 13 (CI/CD) já estabelecem o objetivo de entregar ``um executável portátil, sem exigir que o usuário instale pacotes C++ ou DLLs extras''. Uma biblioteca compartilhada quebraria essa promessa -- o usuário precisaria ter o \texttt{.so}/\texttt{.dll} certo instalado no sistema. Uma biblioteca estática resolve isso: o \texttt{core} inteiro vira parte do binário final do \texttt{cli} (e, futuramente, da \texttt{gui}), sem dependências externas em tempo de execução.
+    \item \texttt{target\_include\_directories(retroforge\_core \textbf{PUBLIC} .../include)}: esta é a linha mais importante da separação \texttt{include/}/\texttt{src/} definida no Módulo 0. A palavra-chave \texttt{PUBLIC} diz ao CMake: ``qualquer target que fizer \texttt{target\_link\_libraries} contra \texttt{retroforge\_core} \textbf{também} ganha automaticamente esse diretório de include''. É assim que o \texttt{cli/main.cpp} consegue escrever \texttt{\#include <retroforge/io/BinaryFileReader.hpp>} sem precisar declarar manualmente onde esse cabeçalho está -- o CMake propaga essa informação sozinho.
+    \item \texttt{target\_include\_directories(retroforge\_core \textbf{PRIVATE} .../src)}: já esta linha usa \texttt{PRIVATE}, o oposto de \texttt{PUBLIC}. Isso permite que os arquivos \texttt{.cpp} dentro de \texttt{core/src/} incluam uns aos outros com caminhos relativos internos, \textbf{sem} vazar esse detalhe de implementação para quem consome a biblioteca. O \texttt{cli/} nunca precisa (nem deveria) saber que arquivos internos existem dentro de \texttt{core/src/}.
+    \item \texttt{target\_compile\_features(retroforge\_core PUBLIC cxx\_std\_20)}: reforça, no nível do próprio target, que qualquer código que consome \texttt{retroforge\_core} deve, no mínimo, compilar como C++20 -- redundante com o \texttt{set(CMAKE\_CXX\_STANDARD 20)} raiz, mas é uma prática defensiva: se algum dia o \texttt{core} for extraído para ser usado por \textit{outro} projeto (fora do RetroForge), essa exigência viaja junto com o target, mesmo sem o \texttt{CMakeLists.txt} raiz do RetroForge por perto.
+\end{itemize}
+
+\begin{CaixaCodigo}
+# Arquivo: cli/CMakeLists.txt
+file(GLOB_RECURSE CLI_SOURCES
+    CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
+)
+
+add_executable(retroforge_cli
+    ${CLI_SOURCES}
+)
+
+target_link_libraries(retroforge_cli PRIVATE
+    retroforge_core
+)
+
+target_include_directories(retroforge_cli PRIVATE
+    ${CMAKE_SOURCE_DIR}/external/CLI11/include
+)
+\end{CaixaCodigo}
+
+\begin{itemize}
+    \item \texttt{add\_executable(retroforge\_cli ...)}: diferente de \texttt{add\_library}, este gera um binário executável de verdade -- o programa que o usuário final vai rodar no terminal.
+    \item \texttt{target\_link\_libraries(retroforge\_cli \textbf{PRIVATE} retroforge\_core)}: é aqui que a dependência entre os dois targets é declarada. \texttt{PRIVATE} aqui significa ``o \texttt{cli} usa o \texttt{core} internamente, mas nada que dependa do \texttt{cli} (ninguém depende de um executável, então isso é quase sempre \texttt{PRIVATE} para alvos executáveis) precisa saber disso''. É esta única linha que faz o \texttt{cli/main.cpp} ganhar acesso a tudo que foi declarado como \texttt{PUBLIC} no \texttt{core/CMakeLists.txt} -- os includes, o padrão C++20, tudo propaga por essa cadeia.
+\end{itemize}
+
+\begin{CaixaArvore}
+Grafo de dependencias de targets (estado atual do repositorio):
+
+  retroforge_cli  (executavel)
+        |
+        | target_link_libraries PRIVATE
+        v
+  retroforge_core (biblioteca estatica)
+
+  retroforge_cli tambem enxerga:
+     external/CLI11/include  (apenas ele, via target_include_directories PRIVATE)
+
+  Futuro (Modulo 11):
+
+  retroforge_gui  (executavel, Dear ImGui)
+        |
+        v
+  retroforge_core (o MESMO target -- zero duplicacao de regra de negocio)
+\end{CaixaArvore}
+
+\begin{CaixaAlerta}
+Repare que \texttt{external/CLI11/include} é adicionado como diretório de include \textbf{apenas} no \texttt{cli/CMakeLists.txt}, e como \texttt{PRIVATE}. Isso é intencional: \texttt{CLI11} é uma biblioteca de \textbf{parsing de argumentos de linha de comando} -- ela só faz sentido para a camada de apresentação (\texttt{cli/}). Se o \texttt{core/CMakeLists.txt} também expusesse esse include, estaríamos violando a separação Core/Apresentação estabelecida na documentação: o \texttt{core} passaria a ``saber'' sobre uma biblioteca que só existe para interpretar argumentos de terminal, algo que não faz sentido para a futura \texttt{gui/} (Dear ImGui não lê argumentos de CLI da mesma forma).
+\end{CaixaAlerta}
+
+\subsection{\texttt{file(GLOB\_RECURSE ... CONFIGURE\_DEPENDS)}: conveniência com uma pegadinha conhecida}
+
+Tanto \texttt{core/CMakeLists.txt} quanto \texttt{cli/CMakeLists.txt} usam \texttt{file(GLOB\_RECURSE ...)} em vez de listar cada arquivo \texttt{.cpp} manualmente. Isso significa: ``varra recursivamente esta pasta e me dê todos os arquivos que baterem com este padrão''.
+
+\begin{itemize}
+    \item \textbf{Vantagem:} conforme o projeto cresce -- e ele vai crescer muito, com um arquivo \texttt{.cpp} novo por detector de console (Módulo 2), por conversor (Módulo 3), por componente do Thread Pool (Módulo 4) -- ninguém precisa lembrar de editar o \texttt{CMakeLists.txt} toda vez que cria um arquivo novo. Isso é coerente com o Princípio Aberto/Fechado do Módulo 0: adicionar um \texttt{XboxDetector.cpp} não deveria exigir tocar em nenhum arquivo de build.
+    \item \textbf{A pegadinha:} por padrão, \texttt{file(GLOB\_RECURSE ...)} só é avaliado \textbf{uma vez}, no momento da configuração do CMake. Se você adicionar um arquivo novo depois, o CMake não sabe que precisa se reconfigurar -- o arquivo simplesmente não entra no build até você rodar \texttt{cmake} manualmente de novo. A palavra-chave \texttt{CONFIGURE\_DEPENDS} (disponível desde a versão mínima que declaramos, 3.20) resolve isso: ela instrui os geradores suportados (Makefiles, Ninja) a checarem, a cada build, se a lista de arquivos mudou, e reconfigurar automaticamente se necessário.
+\end{itemize}
+
+\begin{CaixaAlerta}
+\texttt{CONFIGURE\_DEPENDS} \textbf{não é perfeito} em todos os geradores e sistemas de arquivo (a própria documentação oficial do CMake é cautelosa a respeito, especialmente em sistemas de arquivos de rede). Para um projeto individual ou de comunidade pequena/média como o RetroForge, o ganho de conveniência supera o risco -- mas se, no futuro, o time notar builds ``fantasmas'' (um arquivo removido continua sendo linkado, por exemplo), a solução definitiva é abandonar o \texttt{GLOB\_RECURSE} e listar os arquivos-fonte explicitamente. Vale a pena guardar essa alternativa na manga; não é preciso resolver isso agora.
+\end{CaixaAlerta}
+
+\subsection{Vinculando bibliotecas externas: o caso do CLI11 (header-only) e o que vem depois}
+
+O arquivo \texttt{.gitmodules} já presente no repositório declara:
+
+\begin{CaixaCodigo}
+[submodule "external/CLI11"]
+	path = external/CLI11
+	url = https://github.com/CLIUtils/CLI11.git
+\end{CaixaCodigo}
+
+Isso usa \textbf{submódulos Git}, não o CMake diretamente: é uma forma de ``embutir'' o repositório inteiro da biblioteca \texttt{CLI11} dentro de \texttt{external/CLI11}, versionado por commit específico, sem copiar o código dela para dentro do repositório do RetroForge. Quem clona o projeto precisa rodar \texttt{git submodule update --init --recursive} para that pasta ser preenchida.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{CLI11} não precisa de \texttt{target\_link\_libraries}:} \texttt{CLI11} é uma biblioteca \textbf{header-only} -- ela não tem arquivos \texttt{.cpp} para compilar, é inteira feita de templates e código dentro de arquivos \texttt{.hpp}. Por isso, ``usá-la'' é simplesmente apontar um diretório de include para ela (\texttt{target\_include\_directories}, como já vimos), sem nenhum passo de compilação ou link adicional.
+    \item \textbf{O que muda quando a biblioteca \textit{não} é header-only:} bibliotecas futuras do projeto -- \texttt{xxHash} (Módulo 2/10, hashing), \texttt{libcurl} (Módulo 5, scraper opcional) e \texttt{OpenSSL} (hashing alternativo) -- possuem código \texttt{.c}/\texttt{.cpp} que precisa ser compilado e depois linkado de verdade. Para essas, duas estratégias serão usadas mais adiante no livro:
+    \begin{enumerate}
+        \item \texttt{find\_package(...)}: pede ao CMake para localizar uma versão \textbf{já instalada no sistema} (ex: via \texttt{apt install libcurl4-openssl-dev} no Linux, já usado inclusive no workflow de CI atual para instalar o \texttt{clang-format}).
+        \item \texttt{FetchContent}: baixa o código-fonte da dependência em tempo de configuração e a compila junto com o RetroForge, sem exigir que o usuário tenha nada pré-instalado -- mais alinhado com a meta de portabilidade da Seção 2 da documentação, e a estratégia que preferimos para bibliotecas pequenas como \texttt{xxHash}.
+    \end{enumerate}
+\end{itemize}
+
+\begin{CaixaInfo}
+Guarde esta regra prática: \textbf{header-only $\Rightarrow$ apenas \texttt{target\_include\_directories}}; \textbf{compilada $\Rightarrow$ \texttt{find\_package} ou \texttt{FetchContent} + \texttt{target\_link\_libraries}}. Vamos aplicar exatamente essa distinção quando o Módulo 2 precisar de \texttt{xxHash} de verdade.
+\end{CaixaInfo}
+
+\subsection{Gerando código C++ a partir do CMake: a classe \texttt{BuildInfo}}
+\label{sec:buildinfo}
+
+Até aqui, o CMake só organizou arquivos que \textit{nós} escrevemos manualmente. Mas ele também pode \textbf{gerar} um arquivo \texttt{.hpp} automaticamente, substituindo variáveis do CMake (como \texttt{PROJECT\_VERSION}, definido no \texttt{project(...)} raiz) dentro de um arquivo-modelo. Isso é exatamente o que o Módulo 6 vai precisar para exibir a versão do programa (SemVer) tanto no comando \texttt{retroforge --version} quanto, futuramente, na tela ``Sobre'' da GUI -- sem que ninguém precise atualizar manualmente um número de versão em três lugares diferentes do código.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{BuildInfo} existe:} é a única classe do projeto cuja fonte de verdade não é escrita por um humano diretamente em \texttt{.cpp}, mas \textbf{gerada pelo CMake} a partir da versão declarada uma única vez em \texttt{project(RetroForge VERSION 0.1.0 ...)}. Sua responsabilidade única é expor essa informação (versão, e futuramente o hash do commit Git) como constantes C++ fortemente tipadas, em vez de espalhar \texttt{\#define} soltos pelo código.
+    \item \textbf{Como se comunica com outras classes:} é consumida pela camada de apresentação -- o \texttt{cli/main.cpp} (Módulo 11) vai chamar \texttt{retroforge::core::BuildInfo::version\_string()} ao processar a flag \texttt{--version} do CLI11 -- e, futuramente, pela \texttt{gui/}. Nenhuma classe de regra de negócio (\texttt{ConsoleIdentifier}, os conversores) depende dela.
+    \item \textbf{Onde ela mora:} o \textit{template} fonte fica versionado em \texttt{core/include/retroforge/core/BuildInfo.hpp.in}; o CMake processa esse template e escreve o \texttt{.hpp} final \textbf{gerado} (portanto \textbf{não versionado no Git} -- vai para o \texttt{.gitignore}) dentro da pasta de build, em \texttt{build/generated/retroforge/core/BuildInfo.hpp}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/core/BuildInfo.hpp.in
+// (template -- as variaveis entre @...@ sao substituidas pelo CMake)
+#pragma once
+
+#include <string_view>
+
+namespace retroforge::core {
+
+// Responsabilidade unica: expor metadados de versao gerados em tempo de
+// configuracao do CMake. Nao possui logica alguma, apenas constantes.
+class BuildInfo {
+public:
+    static constexpr int major = @PROJECT_VERSION_MAJOR@;
+    static constexpr int minor = @PROJECT_VERSION_MINOR@;
+    static constexpr int patch = @PROJECT_VERSION_PATCH@;
+
+    static constexpr std::string_view version_string() {
+        return "@PROJECT_VERSION@";
+    }
+};
+
+} // namespace retroforge::core
+\end{CaixaCodigo}
+
+Para que esse template vire um \texttt{.hpp} de verdade, adicionamos ao \texttt{core/CMakeLists.txt} a chamada \texttt{configure\_file}, e informamos ao target onde encontrar o resultado gerado:
+
+\begin{CaixaCodigo}
+# Adicao ao core/CMakeLists.txt
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/retroforge/core/BuildInfo.hpp.in
+    ${CMAKE_BINARY_DIR}/generated/retroforge/core/BuildInfo.hpp
+    @ONLY
+)
+
+target_include_directories(retroforge_core PUBLIC
+    ${CMAKE_BINARY_DIR}/generated
+)
+\end{CaixaCodigo}
+
+\begin{itemize}
+    \item \texttt{configure\_file(origem destino @ONLY)}: lê o arquivo de origem, substitui qualquer \texttt{@VARIAVEL@} pelo valor real daquela variável do CMake, e escreve o resultado no destino. A opção \texttt{@ONLY} restringe a substituição apenas ao formato \texttt{@VAR@} (evitando conflito acidental com a sintaxe \texttt{\${VAR}} usada dentro do próprio C++, como em \texttt{std::string}).
+    \item \texttt{\$\{CMAKE\_BINARY\_DIR\}}: é a pasta de build (ex: \texttt{build/}) -- \textbf{nunca} a pasta de código-fonte. Arquivos gerados nunca devem ser escritos dentro de \texttt{core/include/} de verdade, ou corremos o risco de alguém commitar acidentalmente um artefato gerado no Git.
+    \item A segunda chamada de \texttt{target\_include\_directories} adiciona a pasta \textbf{de build} onde o \texttt{.hpp} gerado foi escrito, para que \texttt{\#include <retroforge/core/BuildInfo.hpp>} funcione normalmente em qualquer arquivo \texttt{.cpp} do projeto, exatamente como qualquer outro cabeçalho do Core.
+\end{itemize}
+
+\begin{CaixaAlerta}
+Todo arquivo gerado por \texttt{configure\_file} (ou por \texttt{FetchContent}, que veremos em módulos futuros) deve ser escrito \textbf{dentro} da pasta de build (\texttt{\$\{CMAKE\_BINARY\_DIR\}}), nunca dentro de \texttt{core/include/} real. A pasta \texttt{build/} já está no \texttt{.gitignore} do projeto -- isso garante que artefatos gerados nunca poluam o histórico do Git nem entrem em conflito de merge entre dois desenvolvedores com números de versão diferentes em builds locais.
+\end{CaixaAlerta}
+
+\subsection{\texttt{compile\_commands.json}, \texttt{.clangd} e a experiência de edição no Zed}
+\label{sec:clangd}
+
+A documentação do projeto (Seção 2) menciona explicitamente um ambiente de desenvolvimento leve como o Zed. Isso só funciona bem por causa de dois arquivos que já existem no repositório:
+
+\begin{CaixaCodigo}
+# Arquivo: .clangd
+CompileFlags:
+  CompilationDatabase: build
+\end{CaixaCodigo}
+
+O \texttt{clangd} é um servidor de linguagem (LSP) usado por editores modernos (Zed, VS Code, Neovim) para oferecer autocompletar, ir-para-definição e diagnósticos em tempo real para C++. Mas o \texttt{clangd} não sabe, sozinho, quais \textit{flags} de compilação (padrão C++, diretórios de include, macros) cada arquivo do projeto usa -- essa informação está espalhada pelos vários \texttt{target\_include\_directories} e \texttt{target\_compile\_features} que vimos nas seções anteriores.
+
+É exatamente para isso que serve o \texttt{compile\_commands.json} gerado pela flag \texttt{CMAKE\_EXPORT\_COMPILE\_COMMANDS ON} (já definida no \texttt{CMakeLists.txt} raiz): um arquivo JSON com o comando de compilação \textbf{exato} usado para cada \texttt{.cpp} do projeto. O arquivo \texttt{.clangd} acima simplesmente aponta para a pasta \texttt{build/}, dizendo ``procure o \texttt{compile\_commands.json} ali dentro''. O resultado prático: o autocompletar no editor enxerga \textbf{exatamente} os mesmos includes e flags que o compilador real vai usar -- zero divergência entre ``o que o editor acha que existe'' e ``o que realmente compila''.
+
+\begin{CaixaInfo}
+Isso também explica a linha \texttt{compile\_commands.json} dentro do \texttt{.gitignore} do projeto: esse arquivo é \textbf{sempre} gerado (nunca escrito à mão), específico da máquina e da pasta de build de cada desenvolvedor, e por isso nunca deve ser versionado no Git -- o mesmo raciocínio do \texttt{BuildInfo.hpp} gerado na seção anterior.
+\end{CaixaInfo}
+
+\subsection{\texttt{.clang-format} e a integração com o CI}
+
+O repositório já define um estilo de formatação de código:
+
+\begin{CaixaCodigo}
+# Arquivo: .clang-format
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+Standard: c++20
+\end{CaixaCodigo}
+
+E o workflow de CI (\texttt{.github/workflows/cmake-single-platform.yml}) já executa, antes mesmo de tentar compilar, o seguinte passo:
+
+\begin{CaixaCodigo}
+- name: Check Code Formatting
+  run: |
+    sudo apt-get update && sudo apt-get install -y clang-format
+    find core cli -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.h" \) | xargs -r clang-format --dry-run --Werror
+\end{CaixaCodigo}
+
+\begin{itemize}
+    \item \texttt{--dry-run}: pede ao \texttt{clang-format} para \textbf{simular} a formatação e reportar o que mudaria, sem de fato reescrever os arquivos.
+    \item \texttt{--Werror}: transforma qualquer diferença de formatação encontrada em um \textbf{erro fatal} -- se um Pull Request contém código fora do padrão definido em \texttt{.clang-format}, o CI falha imediatamente, antes mesmo de gastar tempo de máquina tentando compilar um código que nem está formatado corretamente.
+    \item \textbf{Por que isso importa para um projeto open source (Módulo 14):} quando dezenas de contribuidores da comunidade enviam código com estilos de indentação diferentes, revisões de Pull Request desperdiçam tempo discutindo formatação em vez de lógica. Automatizar essa checagem no CI remove esse atrito completamente -- ninguém precisa ``pedir'' para formatar o código, o CI simplesmente recusa o que não está formatado.
+\end{itemize}
+
+\subsection{Arquitetura de Pastas: o que já existe, o que este módulo formaliza, e o que vem a seguir}
+
+O estado atual do repositório, do ponto de vista de build, é este:
+
+\begin{CaixaArvore}
+RetroForge/                          (estado ATUAL do repositorio)
+|-- CMakeLists.txt                   [ja existe]  orquestra os subprojetos
+|-- .gitmodules                      [ja existe]  aponta external/CLI11
+|-- .clang-format                    [ja existe]  estilo de codigo
+|-- .clangd                          [ja existe]  liga o editor ao build/
+|-- .gitignore                       [ja existe]  ignora build/, *.o, etc.
+|-- .github/workflows/               [ja existe]  CI: formatacao + build
+|-- core/
+|   |-- CMakeLists.txt               [ja existe]
+|   |-- include/retroforge/...       [Modulo 0]
+|   `-- src/...                      [Modulo 0]
+|-- cli/
+|   |-- CMakeLists.txt               [ja existe]
+|   `-- main.cpp                     [placeholder, ainda vazio]
+`-- external/
+    `-- CLI11/                      [submodulo Git, header-only]
+\end{CaixaArvore}
+
+Este módulo formaliza duas peças novas dentro dessa estrutura já existente, sem quebrar nada: o par \texttt{BuildInfo.hpp.in} / \texttt{BuildInfo.hpp} (gerado) discutido na Seção~\ref{sec:buildinfo}, morando em \texttt{core/include/retroforge/core/} (fonte) e \texttt{build/generated/retroforge/core/} (gerado). A subpasta \texttt{core/include/retroforge/core/} é nova neste módulo -- reservada especificamente para metadados e utilitários transversais do próprio Core (como \texttt{BuildInfo}), que não pertencem a nenhuma área de responsabilidade específica como \texttt{io/}, \texttt{process/} ou \texttt{identification/}.
+
+Olhando à frente, aqui está o que \textbf{ainda não existe}, mas já tem seu lugar reservado na arquitetura -- e em qual módulo cada peça vai ser construída:
+
+\begin{CaixaArvore}
+RetroForge/                          (estado FUTURO, ao final do livro)
+|-- CMakeLists.txt                    add_subdirectory(gui) descomentado
+|-- core/                             (sem mudancas estruturais grandes)
+|-- cli/                              (main.cpp implementado, Modulo 11)
+|-- gui/                       [NOVO] Dear ImGui, Modulo 11
+|   `-- CMakeLists.txt                linka retroforge_core, igual ao cli/
+|-- external/
+|   |-- CLI11/                        [ja existe]
+|   |-- xxHash/                [NOVO] vindo via FetchContent, Modulo 2/10
+|   `-- (libcurl via find_package, sem pasta local)   Modulo 5
+`-- tests/                     [NOVO] Modulo 12
+    |-- CMakeLists.txt                 target retroforge_tests (Catch2/GTest)
+    `-- identification/
+        `-- ConsoleIdentifierTests.cpp
+\end{CaixaArvore}
+
+\begin{itemize}
+    \item \textbf{\texttt{gui/} (Módulo 11):} quando essa pasta nascer, seu \texttt{CMakeLists.txt} vai ser quase um espelho do \texttt{cli/CMakeLists.txt} de hoje -- \texttt{add\_executable(retroforge\_gui ...)} seguido de \texttt{target\_link\_libraries(retroforge\_gui PRIVATE retroforge\_core)}. É exatamente por causa da separação Core/Apresentação, defendida desde o Módulo 0 e reforçada por este módulo (\texttt{PUBLIC} vs.\ \texttt{PRIVATE} nos includes), que essa futura pasta vai conseguir reaproveitar 100\% da lógica de negócio sem tocar em uma linha do \texttt{core/}.
+    \item \textbf{\texttt{external/xxHash/} (Módulo 2/10):} diferente do \texttt{CLI11}, o \texttt{xxHash} tem um pequeno arquivo \texttt{.c} de implementação. Em vez de um submódulo Git manual, vamos usar \texttt{FetchContent\_Declare} + \texttt{FetchContent\_MakeAvailable} no \texttt{core/CMakeLists.txt}, que baixa e compila a biblioteca automaticamente durante a configuração -- sem exigir que o contribuidor rode comandos extras de submódulo.
+    \item \textbf{\texttt{libcurl} (Módulo 5), sem pasta em \texttt{external/}:} por ser uma biblioteca grande, com muitas dependências do próprio sistema operacional (SSL, zlib), ela será localizada via \texttt{find\_package(CURL REQUIRED)}, assumindo que o usuário (ou o runner de CI) já a tem instalada -- exatamente como o próprio workflow de CI atual já instala o \texttt{clang-format} via \texttt{apt-get} antes de usá-lo.
+    \item \textbf{\texttt{tests/} (Módulo 12):} vai ganhar seu próprio \texttt{CMakeLists.txt}, definindo um target \texttt{retroforge\_tests} que também linka contra \texttt{retroforge\_core} -- assim os testes exercitam exatamente o mesmo código compilado que vai para o \texttt{cli}/\texttt{gui} finais, nunca uma cópia paralela.
+\end{itemize}
+
+\begin{CaixaInfo}
+Um padrão se repete em todas as peças futuras acima: \textbf{tudo depende de \texttt{retroforge\_core}, e \texttt{retroforge\_core} não depende de nada além de si mesmo e de bibliotecas puramente técnicas} (xxHash, libcurl). Nem a \texttt{gui/}, nem os \texttt{tests/}, nem o \texttt{cli/} jamais aparecem como dependência de volta para o \texttt{core/}. Esse é o Grafo de Dependências mais simples e mais seguro que um projeto C++ pode ter -- uma árvore, nunca um ciclo -- e é uma consequência direta de levarmos a sério, desde o \texttt{CMakeLists.txt}, a separação Core/Apresentação definida na documentação do RetroForge.
+\end{CaixaInfo}
+
+\subsection{Exercícios Práticos do Módulo 1}
+
+\begin{CaixaDesafio}
+Lembrete das etiquetas: \textbf{[projeto]} = vira arquivo/pasta permanente do repositório; \textbf{[laboratório]} = validação prática descartável (não precisa sobreviver no repositório depois de feito).
+
+\begin{enumerate}[label=\textbf{1.\arabic*}]
+    \item \textbf{[laboratório]} Rode manualmente as duas etapas do CMake no seu clone do repositório: \texttt{cmake -B build} e depois \texttt{cmake --build build}. Abra o \texttt{build/compile\_commands.json} gerado e identifique, para o arquivo \texttt{cli/main.cpp}, quais diretórios de include aparecem no comando de compilação -- confirme que \texttt{core/include} e \texttt{external/CLI11/include} estão lá.
+    \item \textbf{[projeto]} Crie o arquivo \texttt{core/include/retroforge/core/BuildInfo.hpp.in} e a chamada \texttt{configure\_file} apresentados na Seção~\ref{sec:buildinfo} -- esse par (template + regra de CMake) é permanente. Escreva também um pequeno \texttt{main()} temporário em \texttt{cli/main.cpp} que imprima \texttt{retroforge::core::BuildInfo::version\_string()} e confirme que ele imprime \texttt{"0.1.0"} (esse \texttt{main()} de teste é descartável -- o \texttt{main()} de verdade só nasce no Módulo 11).
+    \item \textbf{[laboratório]} Altere a versão no \texttt{project(RetroForge VERSION 0.1.0 ...)} raiz para \texttt{0.2.0}, reconfigure o CMake, e confirme que o \texttt{BuildInfo.hpp} gerado (dentro de \texttt{build/generated/...}) foi atualizado automaticamente, sem que você tenha editado esse arquivo manualmente. Depois volte a versão para \texttt{0.1.0} -- é só uma verificação, não uma mudança definitiva.
+    \item \textbf{[projeto]} Crie a pasta \texttt{tests/} com um \texttt{CMakeLists.txt} mínimo (mesmo sem nenhum framework de teste ainda -- isso vem no Módulo 12) e adicione \texttt{add\_subdirectory(tests)} ao \texttt{CMakeLists.txt} raiz, comentado, seguindo o mesmo padrão já usado para \texttt{gui/}. Essa pasta e essa linha ficam no repositório, esperando o Módulo 12.
+    \item \textbf{[laboratório]} Experimente remover a palavra-chave \texttt{CONFIGURE\_DEPENDS} do \texttt{file(GLOB\_RECURSE ...)} do \texttt{core/CMakeLists.txt}. Adicione um novo arquivo \texttt{.cpp} qualquer em \texttt{core/src/} e rode apenas \texttt{cmake --build build} (sem reconfigurar manualmente). Observe que o arquivo novo \textbf{não} é compilado -- depois, adicione \texttt{CONFIGURE\_DEPENDS} de volta e repita o teste para confirmar a diferença de comportamento. Desfaça a remoção ao final: o \texttt{CONFIGURE\_DEPENDS} definitivo do projeto continua sendo o do texto.
+    \item \textbf{[laboratório]} Rode \texttt{clang-format --dry-run --Werror} manualmente sobre um arquivo \texttt{.cpp} do Módulo 0 propositalmente mal-indentado, e confirme que ele retorna código de erro diferente de zero -- exatamente o que o CI faz automaticamente a cada Pull Request.
+\end{enumerate}
+\end{CaixaDesafio}
+
+\begin{CaixaResumo}
+Neste módulo você aprendeu:
+\begin{itemize}
+    \item Que o CMake não compila nada -- ele \textbf{gera} os arquivos de build nativos de cada plataforma a partir de uma descrição abstrata do projeto.
+    \item A ler, linha por linha, os arquivos \texttt{CMakeLists.txt} raiz, \texttt{core/} e \texttt{cli/} que já existem no repositório do RetroForge, entendendo o papel de \texttt{project()}, \texttt{add\_subdirectory}, \texttt{add\_library STATIC}, \texttt{add\_executable} e \texttt{target\_link\_libraries}.
+    \item Por que \texttt{target\_include\_directories} usa \texttt{PUBLIC} para \texttt{include/} e \texttt{PRIVATE} para \texttt{src/} -- a mesma separação de API pública vs.\ implementação do Módulo 0, agora expressa em CMake.
+    \item Como \texttt{file(GLOB\_RECURSE ... CONFIGURE\_DEPENDS)} equilibra conveniência (nenhum arquivo de build precisa ser editado ao adicionar uma classe nova) com uma ressalva conhecida sobre confiabilidade em alguns geradores.
+    \item A diferença entre linkar uma biblioteca header-only (\texttt{CLI11}, via submódulo Git e \texttt{target\_include\_directories}) e uma biblioteca compilada (via \texttt{find\_package} ou \texttt{FetchContent}), preparando o terreno para \texttt{xxHash} e \texttt{libcurl}.
+    \item Como o próprio CMake pode \textbf{gerar} um arquivo \texttt{.hpp} de verdade (\texttt{configure\_file}), aplicado na classe \texttt{BuildInfo} -- a primeira classe do projeto cuja fonte de verdade é uma variável do sistema de build, não uma linha escrita à mão.
+    \item Como \texttt{CMAKE\_EXPORT\_COMPILE\_COMMANDS}, o arquivo \texttt{.clangd} e o \texttt{.clang-format} (reforçado no CI) já presentes no repositório sustentam, hoje, a experiência de edição em ferramentas leves como o Zed e a qualidade de código consistente exigida por um projeto open source.
+    \item O mapa completo da arquitetura de pastas relacionada a build: o que já existe (\texttt{core/}, \texttt{cli/}, \texttt{external/CLI11/}), o que este módulo acrescentou (\texttt{core/include/retroforge/core/} para \texttt{BuildInfo}), e o que os módulos seguintes vão adicionar (\texttt{gui/} no Módulo 11, \texttt{external/xxHash/} no Módulo 2/10, \texttt{tests/} no Módulo 12).
+\end{itemize}
+
+Com o esqueleto de build totalmente entendido, o Módulo 2 vai finalmente colocar as classes do Módulo 0 para trabalhar de verdade: o Motor de Identificação Universal vai ler os primeiros bytes de arquivos reais de ROM através do \texttt{BinaryFileReader} e alimentar novos \texttt{IConsoleDetector} concretos -- tudo compilando, a partir de agora, através da estrutura de \texttt{CMakeLists.txt} que acabamos de dissecar.
+\end{CaixaResumo}

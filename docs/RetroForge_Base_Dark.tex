@@ -1,0 +1,197 @@
+\documentclass[12pt, a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[left=2.5cm, right=2.5cm, top=3cm, bottom=3cm]{geometry}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins, breakable}
+\usepackage{lmodern}
+\usepackage{amsmath, amssymb}
+\usepackage{enumitem}
+\usepackage{array}
+
+\renewcommand{\contentsname}{Índice}
+
+\definecolor{RetroForgeDark}{HTML}{1E1E24}
+\definecolor{RetroForgeOrange}{HTML}{FF6B35}
+\definecolor{RetroForgeRed}{HTML}{E84855}
+\definecolor{RetroForgePurple}{HTML}{7A28CB}
+\definecolor{RetroForgeBlue}{HTML}{00A8E8}
+\definecolor{RetroForgeBg}{HTML}{1E1E24}
+
+\pagecolor{RetroForgeBg}
+\AtBeginDocument{\color{white}}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=RetroForgeOrange,
+    urlcolor=RetroForgeBlue,
+    pdftitle={RetroForge - Guia de Estudos e Arquitetura}
+}
+
+\titleformat{\section}
+  {\normalfont\Large\bfseries\color{RetroForgePurple}}
+  {\thesection}{1em}{}
+  [{\color{RetroForgePurple}\titlerule[0.8pt]}]
+
+\titleformat{\subsection}
+  {\normalfont\large\bfseries\color{RetroForgeRed}}
+  {\thesubsection}{1em}{}
+
+\titleformat{\subsubsection}
+  {\normalfont\normalsize\bfseries\color{RetroForgeBlue}}
+  {\thesubsubsection}{1em}{}
+
+\tcbuselibrary{skins, breakable, most, listings}
+
+\lstdefinestyle{RetroForgeCode}{
+    basicstyle=\ttfamily\small\color{white},
+    keywordstyle=\color{RetroForgeOrange}\bfseries,
+    commentstyle=\color{gray},
+    stringstyle=\color{RetroForgeBlue},
+    breaklines=true,
+    showstringspaces=false,
+    tabsize=4,
+    language=C++,
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    numbersep=8pt,
+}
+
+\newtcolorbox{CaixaInfo}[1][]{
+    enhanced,
+    breakable,
+    colback=RetroForgeDark!90!RetroForgeBlue,
+    colframe=RetroForgeBlue,
+    coltitle=white,
+    coltext=white,
+    title={\textbf{Dica / Info}},
+    attach boxed title to top left={xshift=5mm, yshift=-3mm},
+    boxed title style={size=small, colback=RetroForgeBlue, colframe=RetroForgeBlue, rounded corners},
+    drop fuzzy shadow,
+    #1
+}
+
+\newtcolorbox{CaixaAlerta}[1][]{
+    enhanced,
+    breakable,
+    colback=RetroForgeDark!90!RetroForgeOrange,
+    colframe=RetroForgeOrange,
+    coltitle=white,
+    coltext=white,
+    title={\textbf{Atenção / Alerta}},
+    attach boxed title to top left={xshift=5mm, yshift=-3mm},
+    boxed title style={size=small, colback=RetroForgeOrange, colframe=RetroForgeOrange, rounded corners},
+    drop fuzzy shadow,
+    #1
+}
+
+\newtcblisting{CaixaCodigo}{
+    enhanced,
+    breakable,
+    colback=RetroForgeDark!95!white,
+    colframe=RetroForgeDark,
+    coltext=white!90,
+    title={\textbf{Fragmento de Código}},
+    attach boxed title to top left={xshift=5mm, yshift=-3mm},
+    boxed title style={size=small, colback=RetroForgeDark, colframe=RetroForgeDark, rounded corners},
+    drop fuzzy shadow,
+    listing only,
+    listing options={style=RetroForgeCode},
+}
+
+\lstdefinestyle{RetroForgeTree}{
+    basicstyle=\ttfamily\small\color{white},
+    breaklines=false,
+    showstringspaces=false,
+    tabsize=2,
+}
+
+\newtcblisting{CaixaArvore}{
+    enhanced,
+    breakable,
+    colback=RetroForgeDark!95!white,
+    colframe=RetroForgePurple,
+    coltext=white!90,
+    title={\textbf{Estrutura de Pastas}},
+    attach boxed title to top left={xshift=5mm, yshift=-3mm},
+    boxed title style={size=small, colback=RetroForgePurple, colframe=RetroForgePurple, rounded corners},
+    drop fuzzy shadow,
+    listing only,
+    listing options={style=RetroForgeTree},
+}
+
+\newtcolorbox{CaixaDesafio}[1][]{
+    enhanced,
+    breakable,
+    colback=RetroForgeDark!90!RetroForgePurple,
+    colframe=RetroForgePurple,
+    coltitle=white,
+    coltext=white,
+    title={\textbf{Desafio Prático}},
+    attach boxed title to top left={xshift=5mm, yshift=-3mm},
+    boxed title style={size=small, colback=RetroForgePurple, colframe=RetroForgePurple, rounded corners},
+    drop fuzzy shadow,
+    #1
+}
+
+\newtcolorbox{CaixaResumo}[1][]{
+    enhanced,
+    breakable,
+    colback=RetroForgeDark!90!RetroForgeRed,
+    colframe=RetroForgeRed,
+    coltitle=white,
+    coltext=white,
+    title={\textbf{Resumo do Módulo}},
+    attach boxed title to top left={xshift=5mm, yshift=-3mm},
+    boxed title style={size=small, colback=RetroForgeRed, colframe=RetroForgeRed, rounded corners},
+    drop fuzzy shadow,
+    #1
+}
+
+\begin{document}
+
+\begin{titlepage}
+    \begin{tikzpicture}[remember picture, overlay]
+        \fill[RetroForgeDark] (current page.south west) rectangle (current page.north east);
+ 
+        \draw[RetroForgePurple, thick] (current page.south west) grid[step=1cm] (current page.north east);
+        \fill[RetroForgeDark, opacity=0.8] (current page.south west) rectangle (current page.north east);
+
+        \fill[RetroForgeOrange] (current page.north) circle (3cm);
+        \fill[RetroForgeRed, opacity=0.7] (current page.north) circle (2.5cm);
+ 
+        \node[text=white, font=\Huge\bfseries\sffamily, align=center] at (current page.center) {
+            \scalebox{2.5}{RETRO}\\[0.2cm]
+            \scalebox{2.5}{\color{RetroForgeOrange}FORGE}
+        };
+ 
+        \node[text=white, font=\large, align=center, yshift=-3cm] at (current page.center) {
+            GUIA DEFINITIVO DE ARQUITETURA\\
+            E ESTUDOS EM C++ MODERNO
+        };
+ 
+        \node[text=RetroForgeBlue, font=\normalsize, align=center, yshift=-10cm] at (current page.center) {
+            DOCUMENTAÇÃO OFICIAL\\
+            v1.0.0
+        };
+    \end{tikzpicture}
+\end{titlepage}
+
+\newpage
+\tableofcontents
+\newpage
+
+\include{RetroForge_Modulo0}
+\include{RetroForge_Modulo1}
+\include{RetroForge_Modulo2}
+\include{RetroForge_Modulo3}
+\include{RetroForge_Modulo4}
+
+\end{document}

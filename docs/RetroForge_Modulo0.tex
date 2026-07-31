@@ -1,0 +1,943 @@
+\section{Módulo 0: A Fundação em C++ (O Core de Alta Performance)}
+
+O RetroForge não é um script utilitário qualquer: é uma ferramenta que vai varrer discos rígidos inteiros, abrir arquivos de múltiplos gigabytes, disparar processos externos em paralelo e, ainda assim, se comportar de forma previsível e segura. Nada disso é possível se a fundação em C++ estiver mal construída. Antes de escrever uma única linha do Motor de Identificação ou do Thread Pool, precisamos dominar quatro pilares que sustentam absolutamente tudo o que vem depois:
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Orientação a Objetos e Princípios SOLID} -- como vamos organizar o código em classes coesas, desacopladas e extensíveis.
+    \item \textbf{Arquitetura de Pastas} -- onde cada classe mora e por quê.
+    \item \textbf{Manipulação Binária de Arquivos} -- ler ISOs, BINs e CUEs sem jogar 4 GB inteiros na RAM.
+    \item \textbf{Gerenciamento de Memória via Smart Pointers} -- eliminar vazamentos enquanto o programa varre um HD inteiro e dispara subprocessos.
+    \item \textbf{Estruturas de Dados Eficientes e Polimorfismo} -- escolher a coleção certa e a abstração certa para caminhos, metadados, filas e roteamento de consoles.
+\end{enumerate}
+
+\begin{CaixaInfo}
+Este módulo é deliberadamente mais denso em teoria do que os módulos seguintes. É aqui que erros de arquitetura --- se cometidos --- se propagam para o resto do projeto inteiro. A partir daqui, \textbf{todo módulo deste livro vai introduzir classes reais}, explicando para cada uma: (1) por que ela existe, (2) como ela se comunica com as demais, e (3) em qual pasta do projeto ela mora. Vale a pena ler este módulo duas vezes -- ele define o vocabulário e as convenções que os módulos 1 a 14 vão assumir como já conhecidas.
+\end{CaixaInfo}
+
+\subsection{Por que C++17/20 e não C, Rust ou uma linguagem gerenciada?}
+
+Antes de mergulhar em código, é importante justificar a escolha tecnológica que baliza todo o RetroForge.
+
+\begin{itemize}
+    \item \textbf{Zero-cost abstractions:} em C++ moderno, escrever código orientado a objetos e seguro (RAII, smart pointers, classes com interfaces bem definidas) não impõe overhead de performance em tempo de execução comparado ao C puro escrito ``na unha''. Pagamos o custo apenas em tempo de compilação -- nunca em tempo de execução.
+    \item \textbf{Controle de baixo nível quando necessário:} precisamos de acesso a \texttt{mmap}/\texttt{MapViewOfFile}, chamadas POSIX de processos e leitura de bytes crus de um disco. Linguagens totalmente gerenciadas (Java, C\#, Python puro) escondem esse nível de controle ou o tornam custoso.
+    \item \textbf{Ecossistema de bibliotecas de compressão:} \texttt{chdman}, \texttt{maxcso} e \texttt{dolphin-tool} são, em sua maioria, projetos em C/C++. Integrar via subprocesso ou até estaticamente é mais natural nesse ecossistema.
+    \item \textbf{Portabilidade binária:} com CMake e compilação estática, entregamos um executável único para Windows e Linux, sem exigir runtime como o .NET ou uma JVM instalada na máquina do usuário final.
+\end{itemize}
+
+\begin{CaixaAlerta}
+C++ moderno (17/20) não é ``C com classes''. Se você escrever RetroForge usando \texttt{new}/\texttt{delete} manuais, \texttt{char*} crus e \texttt{system()} para tudo, você reintroduz exatamente os bugs de memória e segurança que estamos tentando evitar. A regra de ouro deste projeto é: \textbf{se você está gerenciando um recurso manualmente, provavelmente existe uma abstração da STL ou uma classe do próprio RetroForge que faz isso por você, de forma segura e sem custo extra.}
+\end{CaixaAlerta}
+
+\subsection{Orientação a Objetos e os Princípios SOLID no RetroForge}
+
+O RetroForge não vai ser escrito como uma sequência de funções soltas em um único arquivo \texttt{main.cpp}. Cada responsabilidade do sistema -- ler bytes de um arquivo, identificar um console, gerenciar um processo externo, representar o estado de uma conversão -- vira uma \textbf{classe}, com um contrato (interface) claro e uma única razão para existir. Isso não é purismo acadêmico: é o que permite que a comunidade (Módulo 14) adicione suporte a um novo console \textit{sem tocar} no código que já funciona, e é o que permite testar (Módulo 12) cada peça isoladamente, sem precisar rodar o programa inteiro com um jogo de 4 GB.
+
+Vamos usar os cinco princípios SOLID como bússola ao longo de todo o livro. Aqui está o que cada um significa, especificamente, dentro do RetroForge:
+
+\begin{center}
+\begin{tabular}{|>{\ttfamily}c|p{2.1cm}|p{7.3cm}|}
+\hline
+\textbf{Sigla} & \textbf{Princípio} & \textbf{O que significa no RetroForge} \\
+\hline
+S & Responsabilidade Única & Uma classe como \texttt{BinaryFileReader} só sabe ler bytes de um arquivo. Ela não sabe identificar consoles, não sabe comprimir, não sabe desenhar barra de progresso. \\
+\hline
+O & Aberto/Fechado & Para suportar um novo console (ex: PS3), criamos uma \textbf{nova} classe detectora. Não abrimos e editamos a classe \texttt{ConsoleIdentifier} que já está testada e funcionando. \\
+\hline
+L & Substituição de Liskov & Qualquer detector de console (\texttt{GameCubeDetector}, \texttt{Ps1Detector}, etc.) pode substituir outro dentro de \texttt{ConsoleIdentifier} sem quebrar o comportamento esperado do sistema. \\
+\hline
+I & Segregação de Interface & A interface \texttt{IConsoleDetector} tem só dois métodos. Não existe uma interface gigante ``\texttt{IEverything}'' que obriga uma classe a implementar coisas que ela não usa. \\
+\hline
+D & Inversão de Dependência & \texttt{ConsoleIdentifier} (regra de negócio de alto nível) depende da \textbf{abstração} \texttt{IConsoleDetector}, nunca de uma classe concreta como \texttt{GameCubeDetector} diretamente. \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{CaixaInfo}
+Nem todo princípio SOLID se aplica com a mesma força em toda classe. Uma classe de dados simples, como veremos com \texttt{ConversionJob}, é essencialmente sobre Responsabilidade Única e encapsulamento -- não faz sentido forçar uma interface polimórfica nela só para ``usar SOLID''. Aplicar SOLID onde \textit{faz sentido} é, em si, uma decisão de engenharia -- e vamos justificar cada escolha ao longo do livro.
+\end{CaixaInfo}
+
+\subsection{Arquitetura de Pastas do Projeto}
+
+A documentação do RetroForge já estabelece a regra mais importante de arquitetura: separação estrita entre a \textbf{Regra de Negócio (Core)} e a \textbf{Camada de Apresentação (CLI/GUI)}. O repositório atual já reflete o início dessa separação, com as pastas \texttt{core/} e \texttt{cli/} orquestradas por um \texttt{CMakeLists.txt} raiz. A partir deste módulo, vamos formalizar e expandir essa estrutura -- ela é o ``mapa'' que usaremos em todos os módulos seguintes para saber onde cada nova classe deve morar.
+
+\begin{CaixaArvore}
+RetroForge/
+|-- CMakeLists.txt              (raiz: orquestra os subprojetos)
+|-- core/                       (Regra de Negocio -- NUNCA depende de UI)
+|   |-- CMakeLists.txt
+|   |-- include/
+|   |   `-- retroforge/
+|   |       |-- io/
+|   |       |   |-- BinaryFileReader.hpp
+|   |       |-- process/
+|   |       |   |-- ExternalProcessHandle.hpp
+|   |       |-- identification/
+|   |       |   |-- IConsoleDetector.hpp
+|   |       |   |-- ConsoleIdentifier.hpp
+|   |       |   `-- detectors/
+|   |       |       |-- GameCubeDetector.hpp
+|   |       |       `-- Ps1Detector.hpp
+|   |       `-- models/
+|   |           |-- Console.hpp
+|   |           `-- ConversionJob.hpp
+|   `-- src/
+|       |-- io/
+|       |   |-- BinaryFileReader.cpp
+|       |-- process/
+|       |   |-- ExternalProcessHandle.cpp
+|       `-- identification/
+|           |-- ConsoleIdentifier.cpp
+|           `-- detectors/
+|               |-- GameCubeDetector.cpp
+|               `-- Ps1Detector.cpp
+|-- cli/                        (Apresentacao: terminal, usa CLI11)
+|   |-- CMakeLists.txt
+|   `-- main.cpp
+|-- gui/                        (Apresentacao: Dear ImGui -- futuro, Modulo 11)
+|-- external/                   (dependencias de terceiros: CLI11, etc.)
+`-- tests/                      (Modulo 12: Catch2 ou GTest)
+\end{CaixaArvore}
+
+\subsubsection{Por que separar \texttt{include/} de \texttt{src/}?}
+
+Esta é uma convenção profissional de projetos C++ de médio/grande porte, e vamos segui-la a partir deste módulo:
+
+\begin{itemize}
+    \item \textbf{\texttt{include/retroforge/...}} contém apenas os arquivos \texttt{.hpp} -- a \textbf{API pública} de cada classe: o que ela promete fazer, sem revelar como. É isso que o \texttt{cli/} (e futuramente o \texttt{gui/}) vai enxergar via \texttt{target\_include\_directories}.
+    \item \textbf{\texttt{src/...}} contém os arquivos \texttt{.cpp} -- a \textbf{implementação} de fato. Detalhes internos (como exatamente lemos os bytes, como exatamente chamamos \texttt{popen}) ficam isolados aqui e podem mudar livremente sem que o \texttt{cli/} precise recompilar contra uma nova interface.
+    \item O prefixo \texttt{retroforge/} dentro de \texttt{include/} evita colisão de nomes quando o projeto crescer e for usado como dependência por outro projeto (um \texttt{\#include <retroforge/io/BinaryFileReader.hpp>} é inequívoco).
+\end{itemize}
+
+\subsubsection{Por que subpastas como \texttt{io/}, \texttt{process/}, \texttt{identification/} e \texttt{models/}?}
+
+Cada subpasta corresponde a uma \textbf{área de responsabilidade} do sistema, não a um tipo de dado ou a uma camada técnica genérica. Isso é intencional: quando a comunidade (Módulo 14) quiser adicionar suporte à Xbox, ela sabe, sem perguntar a ninguém, que a nova classe \texttt{XboxDetector} vai morar em \texttt{core/include/retroforge/identification/detectors/} e sua implementação em \texttt{core/src/identification/detectors/}. A pasta \texttt{detectors/} dentro de \texttt{identification/} existe justamente para acomodar o crescimento previsto pelo Princípio Aberto/Fechado: ela vai ganhar um arquivo novo a cada console suportado, sem que os arquivos existentes precisem ser tocados.
+
+A pasta \texttt{models/} tem um papel um pouco diferente das demais: ela não representa uma \textit{operação} do sistema (ler bytes, identificar, gerenciar um processo), mas sim \textbf{vocabulário e estado de domínio} -- tipos simples que várias áreas do projeto precisam compartilhar. É por isso que, mais adiante nesta seção, o \texttt{enum class Console} vai morar sozinho em \texttt{models/Console.hpp}, em vez de ser declarado dentro de \texttt{ConversionJob.hpp} ou de \texttt{IConsoleDetector.hpp}: tanto \texttt{models/} quanto \texttt{identification/} precisam do mesmo vocabulário, e nenhuma das duas áreas deveria ser dona exclusiva dele.
+
+\begin{CaixaAlerta}
+Nunca coloque lógica de negócio (identificação de console, roteamento de compressão, regras de conversão) dentro de \texttt{cli/} ou \texttt{gui/}. Se amanhã a comunidade decidir criar uma GUI em Qt em vez de Dear ImGui, ela deve conseguir reaproveitar 100\% do código em \texttt{core/} sem reescrever nenhuma regra de negócio -- só a apresentação muda.
+\end{CaixaAlerta}
+
+\subsection{Manipulação Binária de Arquivos}
+
+O Motor de Identificação (Módulo 2) precisa ler os primeiros bytes de arquivos que podem ter dezenas de gigabytes (uma ISO de PS2 dual-layer, por exemplo). Se abrirmos esse arquivo da forma errada, ou pior, se tentarmos carregá-lo inteiro na memória, o RetroForge vai travar a máquina do usuário. Tudo começa com \texttt{<fstream>} e o entendimento correto do \textbf{modo binário}.
+
+\subsubsection{Texto vs. Binário: por que o \texttt{ios::binary} é inegociável}
+
+Por padrão, fluxos de arquivo em C++ podem operar em ``modo texto''. Em sistemas como Windows, o modo texto realiza uma tradução automática de quebras de linha (\texttt{\textbackslash n} $\leftrightarrow$ \texttt{\textbackslash r\textbackslash n}) e pode interpretar certos bytes (como \texttt{0x1A}, EOF de DOS) como fim de arquivo prematuro. Uma ISO ou um BIN é uma sequência arbitrária de bytes -- não texto -- e qualquer tradução automática \textbf{corrompe silenciosamente os dados lidos}.
+
+\begin{CaixaAlerta}
+Este é exatamente o tipo de bug que motivou o RetroForge: ferramentas que ``operam às cegas''. Esquecer a flag \texttt{std::ios::binary} ao abrir um \texttt{.iso} no Windows pode fazer o programa interpretar erroneamente o byte \texttt{0x1A} como fim de arquivo, cortando a leitura e gerando um Magic Number incorreto -- o que classificaria o console errado antes mesmo de começarmos a conversão.
+\end{CaixaAlerta}
+
+\begin{CaixaCodigo}
+#include <fstream>
+#include <iostream>
+
+int main() {
+    // SEMPRE combine ios::in (leitura) com ios::binary
+    std::ifstream arquivo("jogo.iso", std::ios::in | std::ios::binary);
+
+    if (!arquivo.is_open()) {
+        std::cerr << "Erro: nao foi possivel abrir o arquivo.\n";
+        return 1;
+    }
+
+    std::cout << "Arquivo aberto em modo binario com seguranca.\n";
+    return 0;
+}
+\end{CaixaCodigo}
+
+\subsubsection{Flags de abertura essenciais}
+
+A tabela a seguir resume as flags de \texttt{std::ios} mais relevantes para o RetroForge:
+
+\begin{center}
+\begin{tabular}{|>{\ttfamily}l|p{9cm}|}
+\hline
+\textbf{Flag} & \textbf{Uso no RetroForge} \\
+\hline
+ios::in & Abrir para leitura (padrão para \texttt{ifstream}). Usado ao ler magic numbers e ao gerar hash. \\
+\hline
+ios::out & Abrir para escrita. Usado ao gravar logs (\texttt{retroforge\_errors.txt}) e arquivos temporários. \\
+\hline
+ios::binary & \textbf{Obrigatório} para qualquer arquivo de ROM/ISO/BIN. Nunca abrir uma imagem de disco sem esta flag. \\
+\hline
+ios::ate & Posiciona o cursor no final do arquivo já na abertura -- útil para descobrir o tamanho do arquivo rapidamente com \texttt{tellg()}. \\
+\hline
+ios::app & Acrescenta ao final do arquivo sem sobrescrever. Ideal para o log concorrente do Módulo 9. \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsubsection{Lendo apenas o necessário: \texttt{seekg}, \texttt{tellg} e leitura posicionada}
+
+O Motor de Identificação não precisa ler o arquivo inteiro -- ele só precisa dos primeiros kilobytes (ou de um offset específico, como o \texttt{0xC2339F3D} do GameCube na posição \texttt{0x1C}). Para isso usamos \texttt{seekg} (posicionar o cursor de leitura) e \texttt{read} (ler um número exato de bytes para um buffer).
+
+\begin{CaixaCodigo}
+#include <fstream>
+#include <array>
+#include <cstdint>
+#include <iostream>
+
+// Le 4 bytes a partir de um offset especifico do arquivo,
+// sem carregar o restante do arquivo na memoria.
+uint32_t ler_magic_number(const std::string& caminho, std::streamoff offset) {
+    std::ifstream arquivo(caminho, std::ios::in | std::ios::binary);
+    if (!arquivo) {
+        throw std::runtime_error("Nao foi possivel abrir: " + caminho);
+    }
+
+    // Posiciona o cursor de leitura no offset desejado
+    arquivo.seekg(offset, std::ios::beg);
+
+    std::array<char, 4> buffer{};
+    arquivo.read(buffer.data(), buffer.size());
+
+    if (arquivo.gcount() != 4) {
+        throw std::runtime_error("Arquivo truncado ou menor que o esperado.");
+    }
+
+    // Monta o inteiro de 32 bits a partir dos 4 bytes lidos (big-endian aqui)
+    uint32_t valor =
+        (static_cast<uint8_t>(buffer[0]) << 24) |
+        (static_cast<uint8_t>(buffer[1]) << 16) |
+        (static_cast<uint8_t>(buffer[2]) << 8)  |
+        (static_cast<uint8_t>(buffer[3]));
+
+    return valor;
+}
+
+int main() {
+    // Assinatura de GameCube esperada na posicao 0x1C
+    constexpr uint32_t MAGIC_GAMECUBE = 0xC2339F3D;
+
+    uint32_t assinatura = ler_magic_number("jogo.iso", 0x1C);
+
+    if (assinatura == MAGIC_GAMECUBE) {
+        std::cout << "Console identificado: Nintendo GameCube\n";
+    } else {
+        std::cout << "Assinatura desconhecida: 0x" << std::hex << assinatura << "\n";
+    }
+
+    return 0;
+}
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Note o uso de \texttt{std::array<char, 4>} em vez de um \texttt{char[4]} cru. \texttt{std::array} tem tamanho fixo conhecido em tempo de compilação, não decai para ponteiro tão facilmente quanto um array C, e se integra naturalmente com \texttt{.data()} e \texttt{.size()} -- ambos aceitos por \texttt{read()}.
+\end{CaixaInfo}
+
+\subsubsection{Lendo arquivos grandes em blocos (\textit{chunks})}
+
+Quando o objetivo não é apenas ler um cabeçalho, mas processar o arquivo inteiro -- como no Scraper Online (Seção 3.6 da documentação), que precisa gerar uma hash \texttt{xxHash} do arquivo completo --, a estratégia correta é ler em blocos de tamanho fixo (por exemplo, 4 MB) em vez de alocar um buffer do tamanho do arquivo inteiro.
+
+\begin{CaixaCodigo}
+#include <fstream>
+#include <vector>
+#include <cstdint>
+#include <iostream>
+
+constexpr size_t TAMANHO_CHUNK = 4 * 1024 * 1024; // 4 MB
+
+void processar_arquivo_em_chunks(const std::string& caminho) {
+    std::ifstream arquivo(caminho, std::ios::in | std::ios::binary);
+    if (!arquivo) {
+        throw std::runtime_error("Falha ao abrir arquivo para hashing.");
+    }
+
+    // Um unico buffer reutilizado a cada iteracao: sem realocacoes constantes
+    std::vector<char> buffer(TAMANHO_CHUNK);
+
+    while (arquivo) {
+        arquivo.read(buffer.data(), buffer.size());
+        std::streamsize bytes_lidos = arquivo.gcount();
+
+        if (bytes_lidos <= 0) {
+            break;
+        }
+
+        // Aqui entraria a chamada real: xxh64_update(estado_hash, buffer.data(), bytes_lidos);
+        std::cout << "Processado bloco de " << bytes_lidos << " bytes.\n";
+    }
+}
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+Nunca faça algo como \texttt{std::vector<char> tudo(tamanho\_do\_arquivo)} seguido de um único \texttt{read()} gigante para arquivos de ROM. Uma ISO de PS2 pode ter 4,7 GB; multiplique isso pelo número de threads simultâneas do Thread Pool (Módulo 4) e você terá um consumo de RAM absurdo e picos de alocação que podem derrubar o processo por falta de memória.
+\end{CaixaAlerta}
+
+\subsubsection{Encapsulando tudo: a classe \texttt{BinaryFileReader}}
+
+As duas funções livres acima (\texttt{ler\_magic\_number} e \texttt{processar\_arquivo\_em\_chunks}) são ótimas para \textbf{entender o mecanismo}, mas não é assim que o código vai viver dentro do RetroForge. Funções soltas que abrem o próprio \texttt{ifstream} a cada chamada não podem ser reutilizadas, testadas isoladamente (Módulo 12) ou substituídas por uma implementação diferente (por exemplo, uma baseada em \textit{memory mapping}, Módulo 10) sem alterar quem as chama.
+
+Por isso, encapsulamos essa responsabilidade em uma classe.
+
+\begin{itemize}
+    \item \textbf{Por que ela existe:} \texttt{BinaryFileReader} tem uma única razão para mudar -- a forma como lemos bytes de um arquivo binário (Princípio da Responsabilidade Única). Ela não sabe o que é um console, um magic number específico ou uma hash; isso é problema de quem a usa.
+    \item \textbf{Como se comunica com outras classes:} \texttt{BinaryFileReader} é uma dependência de baixo nível. No Módulo 2, a classe \texttt{ConsoleIdentifier} (que veremos adiante nesta mesma seção) vai receber uma referência a um \texttt{BinaryFileReader} já aberto e chamar \texttt{read\_at(...)} para obter o cabeçalho do arquivo. Ela não sabe (nem precisa saber) que existe um \texttt{ConsoleIdentifier} -- a dependência é de mão única.
+    \item \textbf{Onde ela mora:} declaração em \texttt{core/include/retroforge/io/BinaryFileReader.hpp}; implementação em \texttt{core/src/io/BinaryFileReader.cpp}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/io/BinaryFileReader.hpp
+#pragma once
+
+#include <cstdint>
+#include <fstream>
+#include <string>
+#include <vector>
+
+namespace retroforge::io {
+
+// Responsabilidade unica: abrir e ler bytes de arquivos binarios de forma
+// segura (RAII, via std::ifstream como membro) e eficiente (leitura
+// posicionada e em blocos). Esta classe NAO sabe nada sobre consoles,
+// hashes ou conversao -- isso pertence a outras classes.
+class BinaryFileReader {
+public:
+    explicit BinaryFileReader(const std::string& caminho);
+
+    // Le 'quantidade' bytes a partir de um offset absoluto do arquivo.
+    std::vector<uint8_t> read_at(std::streamoff offset, size_t quantidade);
+
+    // Le o proximo bloco sequencial de ate 'tamanho_maximo' bytes.
+    // Retorna um vetor vazio quando o arquivo tiver acabado.
+    std::vector<uint8_t> read_next_chunk(size_t tamanho_maximo);
+
+    bool eof() const;
+    std::uintmax_t tamanho_total() const { return tamanho_total_; }
+
+private:
+    std::ifstream arquivo_;       // RAII: fechado automaticamente no destrutor
+    std::uintmax_t tamanho_total_;
+};
+
+} // namespace retroforge::io
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/io/BinaryFileReader.cpp
+#include "retroforge/io/BinaryFileReader.hpp"
+
+#include <filesystem>
+#include <stdexcept>
+
+namespace retroforge::io {
+
+BinaryFileReader::BinaryFileReader(const std::string& caminho)
+    : arquivo_(caminho, std::ios::in | std::ios::binary)
+    , tamanho_total_(0) {
+
+    if (!arquivo_.is_open()) {
+        throw std::runtime_error("Nao foi possivel abrir: " + caminho);
+    }
+
+    tamanho_total_ = std::filesystem::file_size(caminho);
+}
+
+std::vector<uint8_t> BinaryFileReader::read_at(std::streamoff offset, size_t quantidade) {
+    arquivo_.clear();               // limpa eventuais flags de erro/EOF anteriores
+    arquivo_.seekg(offset, std::ios::beg);
+
+    std::vector<uint8_t> buffer(quantidade);
+    arquivo_.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(quantidade));
+
+    // Se o arquivo for menor que o esperado, encolhemos o vetor para o
+    // tamanho realmente lido em vez de devolver lixo de memoria.
+    buffer.resize(static_cast<size_t>(arquivo_.gcount()));
+    return buffer;
+}
+
+std::vector<uint8_t> BinaryFileReader::read_next_chunk(size_t tamanho_maximo) {
+    std::vector<uint8_t> buffer(tamanho_maximo);
+    arquivo_.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(tamanho_maximo));
+    buffer.resize(static_cast<size_t>(arquivo_.gcount()));
+    return buffer;
+}
+
+bool BinaryFileReader::eof() const {
+    return arquivo_.eof();
+}
+
+} // namespace retroforge::io
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Note que o construtor lança uma exceção (\texttt{std::runtime\_error}) em vez de retornar um código de erro. Como o único recurso gerenciado é o \texttt{std::ifstream} (que já é RAII por si só), não precisamos de nenhum \texttt{try/catch} manual aqui para liberar recursos -- se a exceção se propagar, o destrutor de \texttt{arquivo\_} cuida de tudo sozinho. Essa é a essência de RAII combinada com Orientação a Objetos: o objeto garante seu próprio ciclo de vida.
+\end{CaixaInfo}
+
+\subsection{RAII e Gerenciamento de Memória (Smart Pointers)}
+
+RAII (\textit{Resource Acquisition Is Initialization}) é o princípio mais importante de todo o C++ moderno e será citado repetidamente ao longo deste ``livro''. A ideia é simples: \textbf{a aquisição de um recurso (memória, arquivo, handle de processo, mutex) acontece no construtor de um objeto, e a liberação acontece automaticamente no destrutor.} Isso significa que, se o objeto sai de escopo -- seja por um \texttt{return} normal, seja por uma exceção lançada no meio do caminho --, o recurso é liberado sem que o programador precise lembrar de fazê-lo manualmente.
+
+\begin{CaixaInfo}
+\texttt{std::ifstream} e \texttt{std::ofstream} já são exemplos de RAII: o arquivo é fechado automaticamente quando o objeto sai de escopo, mesmo sem uma chamada explícita a \texttt{close()}. É exatamente por isso que a classe \texttt{BinaryFileReader} da seção anterior não precisa de destrutor customizado -- ela delega o RAII do arquivo para o \texttt{std::ifstream} que já possui como membro. Smart pointers estendem esse mesmo princípio para memória alocada dinamicamente e para recursos externos, como handles de processos, que \textbf{não} são RAII por padrão.
+\end{CaixaInfo}
+
+\subsubsection{\texttt{std::unique\_ptr}: posse exclusiva}
+
+\texttt{std::unique\_ptr} representa posse exclusiva de um recurso: só pode existir um \texttt{unique\_ptr} apontando para aquele recurso em um dado momento (ele não pode ser copiado, apenas movido com \texttt{std::move}). É a escolha padrão sempre que não há necessidade de compartilhamento.
+
+No RetroForge, o caso de uso mais direto é encapsular o handle de um processo externo aberto com \texttt{popen} (usado para chamar \texttt{chdman}, \texttt{maxcso} ou \texttt{dolphin-tool}, conforme descrito no Módulo 8). O \texttt{popen} retorna um \texttt{FILE*} cru que precisa ser fechado com \texttt{pclose} -- diferente de um arquivo comum, que se fecharia com \texttt{fclose}. Isso é exatamente o tipo de recurso ``não-RAII por padrão'' que uma classe com \texttt{unique\_ptr} interno resolve.
+
+\begin{itemize}
+    \item \textbf{Por que ela existe:} \texttt{ExternalProcessHandle} tem a única responsabilidade de abrir e garantir o fechamento correto (\texttt{pclose}) de um processo externo, mesmo diante de exceções. Sem essa classe, cada chamada a \texttt{chdman}/\texttt{maxcso}/\texttt{dolphin-tool} no Módulo 8 teria que repetir manualmente a lógica de \texttt{popen}/\texttt{pclose}, arriscando esquecer o fechamento em um caminho de erro.
+    \item \textbf{Como se comunica com outras classes:} será usada pelo \texttt{ThreadPool} (Módulo 4) e pelas classes de conversão específicas (\texttt{ChdmanConverter}, \texttt{MaxcsoConverter}, no Módulo 3), que vão criar uma instância, ler sua saída linha a linha, e deixá-la sair de escopo ao final -- sem nunca chamar \texttt{pclose} manualmente.
+    \item \textbf{Onde ela mora:} declaração em \texttt{core/include/retroforge/process/ExternalProcessHandle.hpp}; implementação em \texttt{core/src/process/ExternalProcessHandle.cpp}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/process/ExternalProcessHandle.hpp
+#pragma once
+
+#include <cstdio>
+#include <memory>
+#include <string>
+
+namespace retroforge::process {
+
+// Responsabilidade unica: gerenciar o ciclo de vida de um processo externo
+// (chdman, maxcso, dolphin-tool) aberto via popen/pclose, garantindo que
+// pclose() SEMPRE seja chamado (RAII via unique_ptr com deleter customizado),
+// mesmo se uma excecao for lancada durante a leitura da saida do processo.
+class ExternalProcessHandle {
+public:
+    explicit ExternalProcessHandle(const std::string& comando);
+
+    // Le uma linha da saida (stdout) do processo. Retorna false no EOF.
+    bool read_line(std::string& linha_destino);
+
+private:
+    struct FechadorDeProcesso {
+        void operator()(FILE* fp) const {
+            if (fp) {
+                pclose(fp);
+            }
+        }
+    };
+
+    std::unique_ptr<FILE, FechadorDeProcesso> handle_;
+};
+
+} // namespace retroforge::process
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/process/ExternalProcessHandle.cpp
+#include "retroforge/process/ExternalProcessHandle.hpp"
+
+#include <array>
+#include <stdexcept>
+
+namespace retroforge::process {
+
+ExternalProcessHandle::ExternalProcessHandle(const std::string& comando)
+    : handle_(popen(comando.c_str(), "r"), FechadorDeProcesso{}) {
+
+    if (!handle_) {
+        throw std::runtime_error("Falha ao iniciar o processo: " + comando);
+    }
+}
+
+bool ExternalProcessHandle::read_line(std::string& linha_destino) {
+    std::array<char, 256> buffer{};
+
+    if (fgets(buffer.data(), static_cast<int>(buffer.size()), handle_.get()) == nullptr) {
+        return false; // EOF ou erro de leitura
+    }
+
+    linha_destino.assign(buffer.data());
+    return true;
+}
+
+} // namespace retroforge::process
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+Se você usar \texttt{new}/\texttt{delete} manualmente ou esquecer o \texttt{pclose()} em um caminho de erro, você vaza um processo filho \textit{zumbi}. Em uma conversão em lote de 50 jogos com cancelamentos individuais (US05), isso rapidamente esgota os descritores de processo do sistema operacional. Encapsular o \texttt{unique\_ptr} \textbf{dentro} de uma classe (em vez de expô-lo diretamente) também impede que outro desenvolvedor, sem saber, chame \texttt{pclose} uma segunda vez por engano -- o encapsulamento aqui não é só sobre organização, é sobre segurança.
+\end{CaixaAlerta}
+
+\subsubsection{\texttt{std::shared\_ptr}: posse compartilhada com contagem de referências}
+
+Quando um mesmo recurso precisa ser acessado por múltiplas partes do sistema simultaneamente -- e não sabemos, em tempo de compilação, qual delas será a última a precisar dele --, usamos \texttt{std::shared\_ptr}. Ele mantém uma contagem de referências atômica e só libera a memória quando o último \texttt{shared\_ptr} apontando para o recurso é destruído.
+
+No contexto do RetroForge, um exemplo natural é o estado de um trabalho de conversão que é referenciado simultaneamente pela fila do Thread Pool, pela interface (para atualizar a barra de progresso) e por um possível callback de log.
+
+\begin{itemize}
+    \item \textbf{Por que ela existe:} \texttt{ConversionJob} representa, e apenas representa, o estado de uma conversão em andamento (caminho de origem, console-alvo, progresso, se foi cancelada). Ela não sabe \textit{como} converter -- isso é responsabilidade das classes conversoras do Módulo 3 (\texttt{ChdmanConverter} e similares), que recebem um \texttt{ConversionJob} como parâmetro.
+    \item \textbf{Como se comunica com outras classes:} é criada uma única vez (via \texttt{std::make\_shared}) quando um arquivo entra na fila (Módulo 4), e a partir daí é compartilhada, como \texttt{shared\_ptr}, entre a fila de execução, a interface (CLI ou GUI) e o sistema de log -- todos leem/alteram seu estado através dos métodos públicos, nunca acessando campos internos diretamente.
+    \item \textbf{Onde ela mora:} declaração em \texttt{core/include/retroforge/models/ConversionJob.hpp}; por ser uma classe simples, sem lógica de I/O, sua implementação pode viver toda no próprio \texttt{.hpp} (\textit{header-only}) ou em \texttt{core/src/models/ConversionJob.cpp} -- optamos pela segunda forma aqui para manter a consistência com o restante do projeto.
+\end{itemize}
+
+\begin{CaixaInfo}[title={Uma decisão pequena que evita um problema grande: onde mora o \texttt{enum Console}}]
+\texttt{ConversionJob} precisa de um tipo para representar ``qual console é esse job''. Mas esse mesmo vocabulário (\texttt{PS1}, \texttt{PS2}, \texttt{GameCube}...) também vai ser necessário poucas páginas à frente, dentro de \texttt{IConsoleDetector} (o Motor de Identificação) e, no Módulo 3, dentro do Motor de Recomendação. Se declarássemos \texttt{enum class Console} diretamente dentro de \texttt{ConversionJob.hpp}, e depois \textbf{de novo} dentro de \texttt{IConsoleDetector.hpp} só porque ``é rápido'', criaríamos dois tipos com o mesmo nome, mas \textbf{tecnicamente distintos} para o compilador -- e no dia em que um precisasse de um valor que o outro não tem (o que vai acontecer no Módulo 2, com \texttt{DreamcastModificado}), os dois começariam a divergir silenciosamente, sem nenhum erro de compilação para avisar. Por isso o enum ganha, desde já, seu próprio arquivo, dedicado só a ele: \texttt{core/include/retroforge/models/Console.hpp}. Toda classe do projeto que precisar desse vocabulário -- \texttt{ConversionJob}, \texttt{IConsoleDetector} e, futuramente, o Motor de Recomendação -- vai apenas \textbf{incluir} esse arquivo, nunca redeclarar o enum.
+\end{CaixaInfo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/models/Console.hpp
+#pragma once
+
+namespace retroforge::models {
+
+// Vocabulario de dominio puro: qual console/formato um arquivo representa.
+// Vive em seu PROPRIO arquivo -- nao dentro de ConversionJob.hpp, nem
+// dentro de IConsoleDetector.hpp -- porque e' reaproveitado por multiplas
+// areas do sistema (models/, identification/ e, a partir do Modulo 3,
+// compression/). Um unico enum, uma unica fonte de verdade: nenhuma dessas
+// areas declara sua propria copia deste tipo.
+enum class Console {
+    PS1,
+    PS2,
+    GameCube,
+    PSP,
+    Dreamcast,
+    Desconhecido
+};
+
+} // namespace retroforge::models
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/models/ConversionJob.hpp
+#pragma once
+
+#include <atomic>
+#include <string>
+
+#include "retroforge/models/Console.hpp"
+
+namespace retroforge::models {
+
+// Representa o ESTADO de uma unica conversao. Compartilhada (shared_ptr)
+// entre a fila do Thread Pool, a GUI/CLI e o sistema de log -- nenhuma
+// dessas partes "possui" o job sozinha; a ultima referencia viva e' quem
+// libera a memoria. Os campos sao privados e atomicos para permitir
+// leitura/escrita segura a partir de threads diferentes (Modulo 4).
+class ConversionJob {
+public:
+    ConversionJob(std::string caminho_origem, Console console_alvo);
+
+    const std::string& caminho_origem() const { return caminho_origem_; }
+    Console console_alvo() const { return console_alvo_; }
+
+    void set_progresso(int percentual) { progresso_.store(percentual); }
+    int progresso() const { return progresso_.load(); }
+
+    void cancelar() { cancelado_.store(true); }
+    bool foi_cancelado() const { return cancelado_.load(); }
+
+private:
+    std::string caminho_origem_;
+    Console console_alvo_;
+    std::atomic<int> progresso_{0};
+    std::atomic<bool> cancelado_{false};
+};
+
+} // namespace retroforge::models
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+#include <memory>
+#include <vector>
+#include <iostream>
+#include "retroforge/models/ConversionJob.hpp"
+
+using retroforge::models::ConversionJob;
+using retroforge::models::Console;
+
+int main() {
+    // Criado uma unica vez, com make_shared (uma so alocacao para o
+    // objeto + bloco de controle de referencias).
+    auto job = std::make_shared<ConversionJob>("jogo.iso", Console::GameCube);
+
+    // A fila do Thread Pool guarda uma copia do shared_ptr (incrementa o contador).
+    std::vector<std::shared_ptr<ConversionJob>> fila_de_execucao;
+    fila_de_execucao.push_back(job);
+
+    // A interface (CLI/GUI) tambem guarda uma referencia para exibir o
+    // progresso, sem se preocupar em saber quem vai destruir o objeto por ultimo.
+    std::shared_ptr<ConversionJob> referencia_da_interface = job;
+    referencia_da_interface->set_progresso(42);
+
+    std::cout << "Progresso atual: " << job->progresso() << "%\n";
+
+    // Quando 'job', 'fila_de_execucao' e 'referencia_da_interface' saem de
+    // escopo, o ConversionJob e' destruido automaticamente na ultima referencia.
+    return 0;
+}
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Prefira sempre \texttt{std::make\_shared<T>(...)} em vez de \texttt{std::shared\_ptr<T>(new T(...))}. \texttt{make\_shared} realiza uma única alocação para o objeto e o bloco de controle (contagem de referências), em vez de duas alocações separadas -- um ganho real de performance quando criamos dezenas de jobs por segundo durante uma varredura de HD.
+\end{CaixaInfo}
+
+\subsubsection{\texttt{std::weak\_ptr}: quebrando ciclos e observando sem possuir}
+
+\texttt{std::weak\_ptr} referencia um recurso gerenciado por \texttt{shared\_ptr} \textbf{sem} incrementar a contagem de referências. É essencial para quebrar referências cíclicas (que causariam vazamento de memória mesmo com \texttt{shared\_ptr}) e para casos em que um objeto precisa ``observar'' outro sem impedir sua destruição.
+
+Um cenário no RetroForge: um \textit{worker} do Thread Pool (Módulo 4) mantém uma referência de volta (\textit{back-reference}) para o gerenciador principal, apenas para reportar progresso -- sem impedir que o gerenciador seja destruído normalmente ao fechar o programa.
+
+\begin{CaixaCodigo}
+#include <memory>
+#include <iostream>
+
+struct GerenciadorDeFila; // forward declaration
+
+struct Worker {
+    std::weak_ptr<GerenciadorDeFila> gerenciador; // nao possui, apenas observa
+
+    void reportar_progresso() {
+        // lock() tenta obter um shared_ptr temporario. Se o gerenciador
+        // ja foi destruido, lock() retorna nullptr em vez de um ponteiro invalido.
+        if (auto ptr_forte = gerenciador.lock()) {
+            // Seguro usar ptr_forte aqui.
+        } else {
+            std::cout << "Gerenciador ja foi encerrado, ignorando report.\n";
+        }
+    }
+};
+\end{CaixaCodigo}
+
+\subsubsection{Comparativo rápido}
+
+\begin{center}
+\begin{tabular}{|>{\ttfamily}l|l|p{6.7cm}|}
+\hline
+\textbf{Tipo} & \textbf{Posse} & \textbf{Uso típico no RetroForge} \\
+\hline
+unique\_ptr & Exclusiva & \texttt{ExternalProcessHandle} (handle de processo via \texttt{popen}), buffers temporários. \\
+\hline
+shared\_ptr & Compartilhada & \texttt{ConversionJob} referenciado pela fila, pela interface e por logs simultaneamente. \\
+\hline
+weak\_ptr & Nenhuma (observador) & Referências de volta em \textit{callbacks} do Thread Pool, evitando ciclos. \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{CaixaAlerta}
+Regra prática deste projeto: comece \textbf{sempre} com \texttt{unique\_ptr}. Só migre para \texttt{shared\_ptr} quando conseguir justificar, por escrito, por que múltiplas partes do sistema precisam de posse simultânea do mesmo recurso -- exatamente como fizemos ao decidir que \texttt{ConversionJob} precisa ser \texttt{shared\_ptr} (fila + interface + log), enquanto \texttt{ExternalProcessHandle} não (só quem o abriu o utiliza).
+\end{CaixaAlerta}
+
+\subsection{Estruturas de Dados Eficientes e Polimorfismo}
+
+Com o binário sendo lido corretamente (via \texttt{BinaryFileReader}) e a memória sob controle via RAII e classes bem encapsuladas, falta a última peça da fundação: escolher as estruturas de dados certas da Standard Template Library (STL) -- e, quando o problema exigir, aplicar polimorfismo para manter o sistema extensível conforme o Princípio Aberto/Fechado.
+
+\subsubsection{\texttt{std::vector}: a coleção padrão}
+
+\texttt{std::vector} armazena elementos em um bloco contíguo de memória. Isso o torna extremamente eficiente para percorrer sequencialmente (excelente localidade de cache) e é a escolha correta, por padrão, para a fila de jobs de conversão (Seção 3.4 da documentação) e para listas de arquivos encontrados durante a varredura recursiva.
+
+\begin{CaixaCodigo}
+#include <vector>
+#include <filesystem>
+#include <string>
+
+namespace fs = std::filesystem;
+
+std::vector<fs::path> coletar_arquivos_validos(const fs::path& raiz) {
+    std::vector<fs::path> arquivos;
+
+    // reserve() evita realocacoes repetidas quando sabemos, aproximadamente,
+    // quantos elementos serao inseridos (otimizacao discutida no Modulo 7).
+    arquivos.reserve(1024);
+
+    for (const auto& entrada : fs::recursive_directory_iterator(raiz)) {
+        if (entrada.is_regular_file()) {
+            arquivos.push_back(entrada.path());
+        }
+    }
+
+    return arquivos;
+}
+\end{CaixaCodigo}
+
+\subsubsection{\texttt{std::string\_view}: strings sem alocação}
+
+Ao processar milhares de caminhos de arquivo durante uma varredura de HD inteiro (US08), extrair substrings (como a extensão de um arquivo) usando \texttt{std::string} tradicional gera uma nova alocação de memória a cada operação. \texttt{std::string\_view} representa uma ``janela'' somente-leitura sobre uma string já existente, sem copiar dados -- ideal para parsing de alta frequência.
+
+\begin{CaixaCodigo}
+#include <string_view>
+#include <iostream>
+
+// Retorna a extensao do arquivo sem alocar memoria nova.
+// std::string_view aponta para dentro da string original.
+std::string_view extrair_extensao(std::string_view caminho) {
+    size_t pos_ponto = caminho.find_last_of('.');
+    if (pos_ponto == std::string_view::npos) {
+        return {};
+    }
+    return caminho.substr(pos_ponto);
+}
+
+int main() {
+    std::string caminho_completo = "/mnt/hd_externo/PS2/God of War II.iso";
+
+    std::string_view extensao = extrair_extensao(caminho_completo);
+    std::cout << "Extensao detectada: " << extensao << "\n"; // .iso
+
+    return 0;
+}
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+\texttt{std::string\_view} \textbf{não possui os dados}, apenas aponta para eles. Se a \texttt{std::string} original sair de escopo ou for modificada antes do \texttt{string\_view}, você terá um ponteiro pendurado (\textit{dangling pointer}) e comportamento indefinido. Nunca retorne um \texttt{string\_view} apontando para uma \texttt{std::string} local que será destruída ao final da função.
+\end{CaixaAlerta}
+
+\subsubsection{Bônus: \texttt{std::filesystem::path}}
+
+Embora não seja uma estrutura de dados no sentido clássico, \texttt{std::filesystem::path} (introduzido no C++17) merece menção aqui por ser o tipo usado em praticamente toda manipulação de caminho no RetroForge, substituindo concatenações manuais de strings com barras (\texttt{"/"} ou \texttt{"\textbackslash\textbackslash"}) que quebram entre Windows e Linux.
+
+\begin{CaixaCodigo}
+#include <filesystem>
+#include <iostream>
+
+namespace fs = std::filesystem;
+
+int main() {
+    fs::path original("/mnt/hd_externo/PS2/God of War II.iso");
+
+    std::cout << "Extensao:  " << original.extension()  << "\n"; // .iso
+    std::cout << "Nome puro: " << original.stem()        << "\n"; // God of War II
+    std::cout << "Pasta pai: " << original.parent_path()  << "\n";
+
+    // replace_extension gera o caminho de saida da conversao automaticamente,
+    // de forma portavel entre sistemas operacionais.
+    fs::path destino = original;
+    destino.replace_extension(".chd");
+    std::cout << "Destino:   " << destino << "\n"; // .../God of War II.chd
+
+    return 0;
+}
+\end{CaixaCodigo}
+
+\subsubsection{Polimorfismo em ação: \texttt{IConsoleDetector} e \texttt{ConsoleIdentifier}}
+
+Uma tabela \texttt{std::unordered\_map<uint32\_t, Console>} resolveria a identificação de um console em O(1) -- e é uma solução perfeitamente válida quando a regra é ``uma assinatura, um console''. Mas o Motor de Identificação (Módulo 2) precisa de mais do que isso: algumas identificações exigem lógica própria (por exemplo, distinguir um \texttt{.gdi} limpo de Dreamcast de um \texttt{.cdi} modificado, Seção 3.1 da documentação v2.0). Uma tabela de \textit{lookup} sozinha não modela bem ``regras'', apenas ``correspondências diretas''.
+
+É aqui que o polimorfismo, guiado pelos princípios Aberto/Fechado, Substituição de Liskov, Segregação de Interface e Inversão de Dependência, entra em cena.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{IConsoleDetector} existe:} é o contrato mínimo (Segregação de Interface -- só dois métodos) que qualquer estratégia de detecção de console deve cumprir. Ela existe para que \texttt{ConsoleIdentifier} nunca precise saber os detalhes de \textit{como} cada console é identificado.
+    \item \textbf{Como se comunica com outras classes:} é implementada por classes concretas como \texttt{GameCubeDetector} e \texttt{Ps1Detector} (uma por console, seguindo Responsabilidade Única), e é consumida exclusivamente por \texttt{ConsoleIdentifier}, que depende apenas da interface -- nunca de uma classe concreta (Inversão de Dependência).
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/identification/IConsoleDetector.hpp}. As implementações concretas moram em \texttt{core/include/retroforge/identification/detectors/} (declaração) e \texttt{core/src/identification/detectors/} (implementação) -- uma subpasta dedicada a crescer conforme novos consoles forem suportados.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/IConsoleDetector.hpp
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+#include "retroforge/models/Console.hpp"
+
+namespace retroforge::identification {
+
+// Reaproveita o MESMO enum ja definido em models/Console.hpp (secao
+// anterior deste modulo) -- NAO redeclaramos "enum class Console" aqui.
+// O 'using' torna Console::PS1, Console::GameCube etc. utilizaveis sem
+// qualificacao dentro de todo o namespace identification, exatamente
+// como se o enum tivesse sido declarado localmente.
+using retroforge::models::Console;
+
+// Interface minima (Segregacao de Interface): qualquer detector so precisa
+// saber responder "esse cabecalho e' o meu console?" e "qual console eu
+// represento?". Nao ha metodos que uma implementacao seja forcada a
+// ignorar ou deixar vazios.
+class IConsoleDetector {
+public:
+    virtual ~IConsoleDetector() = default;
+    virtual bool matches(const std::vector<uint8_t>& cabecalho) const = 0;
+    virtual Console console() const = 0;
+};
+
+} // namespace retroforge::identification
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Note o \texttt{using retroforge::models::Console;} logo no início do namespace \texttt{identification} -- é exatamente a decisão tomada poucas páginas atrás, ao introduzir \texttt{ConversionJob}. Existe um único \texttt{enum class Console} no projeto inteiro, vivendo em \texttt{models/Console.hpp}; cada área do sistema que precisa dele apenas o inclui e, opcionalmente, o reexporta com \texttt{using} para manter a sintaxe local limpa (\texttt{Console::GameCube} em vez de \texttt{retroforge::models::Console::GameCube}). Isso significa que \texttt{identification::Console} e \texttt{models::Console} não são ``parecidos'' -- são, literalmente, o mesmo tipo, e um \texttt{static\_assert(std::is\_same\_v<identification::Console, models::Console>)} em qualquer lugar do projeto compilaria com sucesso.
+\end{CaixaInfo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/detectors/GameCubeDetector.hpp
+#pragma once
+
+#include "retroforge/identification/IConsoleDetector.hpp"
+
+namespace retroforge::identification::detectors {
+
+// Uma classe, um console (Responsabilidade Unica). Substitui qualquer
+// outra implementacao de IConsoleDetector sem quebrar quem a utiliza
+// (Substituicao de Liskov).
+class GameCubeDetector : public IConsoleDetector {
+public:
+    bool matches(const std::vector<uint8_t>& cabecalho) const override;
+    Console console() const override { return Console::GameCube; }
+};
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/identification/detectors/GameCubeDetector.cpp
+#include "retroforge/identification/detectors/GameCubeDetector.hpp"
+
+namespace retroforge::identification::detectors {
+
+bool GameCubeDetector::matches(const std::vector<uint8_t>& cabecalho) const {
+    constexpr size_t OFFSET_ASSINATURA = 0x1C;
+    constexpr uint32_t MAGIC_GAMECUBE = 0xC2339F3D;
+
+    if (cabecalho.size() < OFFSET_ASSINATURA + 4) {
+        return false; // cabecalho lido e' menor do que o necessario
+    }
+
+    uint32_t valor =
+        (static_cast<uint32_t>(cabecalho[OFFSET_ASSINATURA])     << 24) |
+        (static_cast<uint32_t>(cabecalho[OFFSET_ASSINATURA + 1]) << 16) |
+        (static_cast<uint32_t>(cabecalho[OFFSET_ASSINATURA + 2]) << 8)  |
+        (static_cast<uint32_t>(cabecalho[OFFSET_ASSINATURA + 3]));
+
+    return valor == MAGIC_GAMECUBE;
+}
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{ConsoleIdentifier} existe:} é a única classe que orquestra a identificação, mas delega totalmente o ``como'' para os detectores registrados nela. Sua única responsabilidade é: ler o cabeçalho via \texttt{BinaryFileReader} e perguntar, um a um, a cada detector registrado, se ele reconhece aquele cabeçalho.
+    \item \textbf{Como se comunica com outras classes:} depende de \texttt{BinaryFileReader} (para obter os bytes) e de \texttt{IConsoleDetector} (abstração -- nunca de \texttt{GameCubeDetector} ou \texttt{Ps1Detector} diretamente). É consumida pelo Motor de Recomendação (Módulo 3), que recebe o \texttt{Console} identificado e decide a rota de conversão.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/identification/ConsoleIdentifier.hpp} e \texttt{core/src/identification/ConsoleIdentifier.cpp}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/ConsoleIdentifier.hpp
+#pragma once
+
+#include <memory>
+#include <vector>
+
+#include "retroforge/identification/IConsoleDetector.hpp"
+#include "retroforge/io/BinaryFileReader.hpp"
+
+namespace retroforge::identification {
+
+// Orquestra a identificacao, mas NAO sabe como identificar cada console
+// especificamente -- essa responsabilidade fica com cada IConsoleDetector.
+// Depende apenas da abstracao IConsoleDetector (Inversao de Dependencia),
+// nunca de uma classe concreta como GameCubeDetector.
+class ConsoleIdentifier {
+public:
+    // Aberto para extensao (Principio Aberto/Fechado): adicionar suporte a
+    // um novo console e' registrar um novo detector aqui, sem alterar
+    // nenhuma linha do metodo identify() abaixo.
+    void register_detector(std::unique_ptr<IConsoleDetector> detector);
+
+    Console identify(retroforge::io::BinaryFileReader& leitor) const;
+
+private:
+    static constexpr size_t TAMANHO_CABECALHO = 32;
+    std::vector<std::unique_ptr<IConsoleDetector>> detectores_;
+};
+
+} // namespace retroforge::identification
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/identification/ConsoleIdentifier.cpp
+#include "retroforge/identification/ConsoleIdentifier.hpp"
+
+namespace retroforge::identification {
+
+void ConsoleIdentifier::register_detector(std::unique_ptr<IConsoleDetector> detector) {
+    detectores_.push_back(std::move(detector));
+}
+
+Console ConsoleIdentifier::identify(retroforge::io::BinaryFileReader& leitor) const {
+    auto cabecalho = leitor.read_at(0, TAMANHO_CABECALHO);
+
+    for (const auto& detector : detectores_) {
+        if (detector->matches(cabecalho)) {
+            return detector->console();
+        }
+    }
+
+    return Console::Desconhecido;
+}
+
+} // namespace retroforge::identification
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Exemplo de uso (o "fio condutor" que une tudo o que este modulo ensinou)
+#include <iostream>
+
+#include "retroforge/io/BinaryFileReader.hpp"
+#include "retroforge/identification/ConsoleIdentifier.hpp"
+#include "retroforge/identification/detectors/GameCubeDetector.hpp"
+
+using namespace retroforge;
+
+int main() {
+    io::BinaryFileReader leitor("jogo.iso");
+
+    identification::ConsoleIdentifier identificador;
+    identificador.register_detector(
+        std::make_unique<identification::detectors::GameCubeDetector>()
+    );
+    // Novos consoles = novas linhas aqui, sem tocar em ConsoleIdentifier.
+
+    auto console = identificador.identify(leitor);
+
+    if (console == identification::Console::GameCube) {
+        std::cout << "Console identificado: Nintendo GameCube\n";
+    } else {
+        std::cout << "Console nao reconhecido pelos detectores registrados.\n";
+    }
+
+    return 0;
+}
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Repare como \texttt{std::vector<std::unique\_ptr<IConsoleDetector>>} reúne, em uma única linha, três conceitos deste módulo: a coleção certa (\texttt{vector}, para iterar sequencialmente sobre poucos detectores), a posse exclusiva e segura de cada detector (\texttt{unique\_ptr}, já que só o \texttt{ConsoleIdentifier} precisa deles) e o polimorfismo (\texttt{IConsoleDetector} como tipo base, permitindo armazenar \texttt{GameCubeDetector}, \texttt{Ps1Detector} etc. na mesma coleção).
+\end{CaixaInfo}
+
+\begin{CaixaAlerta}
+Se \texttt{ConsoleIdentifier::identify} tivesse, em vez de um \texttt{vector} de detectores, uma cadeia de \texttt{if (assinatura == MAGIC\_GAMECUBE) ... else if (assinatura == MAGIC\_PS1) ...}, cada novo console exigiria \textbf{editar} essa função -- violando o Princípio Aberto/Fechado e aumentando o risco de quebrar a detecção de um console já funcionando ao mexer no código para adicionar outro.
+\end{CaixaAlerta}
+
+\subsection{Exercícios Práticos do Módulo 0}
+
+\begin{CaixaDesafio}
+Antes de avançar para o Módulo 1 (CMake), tente implementar os exercícios abaixo. Eles reaparecerão, direta ou indiretamente, nos módulos seguintes.
+
+A partir deste módulo, cada exercício é marcado com uma etiqueta:
+\textbf{[projeto]} significa que o resultado é código permanente do RetroForge -- uma classe, arquivo ou pasta que passa a existir de verdade no repositório e que módulos futuros vão assumir como já pronta.
+\textbf{[laboratório]} significa que o exercício existe para \textbf{validar seu entendimento na prática} -- um \texttt{main()} descartável, um teste manual, uma reflexão escrita -- e pode ser feito em um arquivo temporário (ou até só no terminal) e depois jogado fora; nenhum módulo futuro depende de esse código específico continuar existindo.
+
+\begin{enumerate}[label=\textbf{0.\arabic*}]
+    \item \textbf{[projeto]} Implemente a classe \texttt{BinaryFileReader} apresentada nesta seção e escreva um pequeno \texttt{main()} que use \texttt{read\_at} para ler os primeiros 32 bytes de um arquivo. (A classe em si é o entregável permanente; o \texttt{main()} de demonstração pode ser descartado depois.)
+    \item \textbf{[laboratório]} Crie um pequeno arquivo binário fictício de 64 bytes contendo, na posição \texttt{0x1C}, os quatro bytes \texttt{0xC2 0x33 0x9F 0x3D}. Use \texttt{BinaryFileReader} + \texttt{GameCubeDetector} para confirmar que a assinatura é detectada corretamente. Este é um teste manual, descartável -- ele será \textbf{formalizado como teste automatizado de verdade} apenas no Módulo 12 (mocking de arquivos binários); não crie nenhuma classe de teste permanente agora.
+    \item \textbf{[projeto]} Implemente uma nova classe \texttt{Ps1Detector} (em \texttt{core/include/retroforge/identification/detectors/Ps1Detector.hpp} e seu \texttt{.cpp} correspondente) que implemente \texttt{IConsoleDetector}, e registre-a em um \texttt{ConsoleIdentifier} \textbf{sem alterar nenhuma linha} da classe \texttt{ConsoleIdentifier} -- na prática, exercitando o Princípio Aberto/Fechado. (Atenção: o Módulo 2 substitui esta abordagem por \texttt{Ps1CueDetector}, baseado em extensão \texttt{.cue} em vez de assinatura binária -- vale a pena fazer este exercício primeiro para sentir na pele \textit{por que} a versão do Módulo 2 é mais adequada, mas o projeto final usa a versão do Módulo 2.)
+    \item \textbf{[laboratório]} Escreva a classe \texttt{ExternalProcessHandle} apresentada nesta seção (o código já está pronto no texto acima -- aqui o foco é você digitá-lo e compilar) e demonstre, com um teste manual, que o processo é encerrado corretamente (\texttt{pclose}) mesmo quando uma exceção é lançada no meio da leitura de sua saída. O teste de demonstração em si é descartável.
+    \item \textbf{[laboratório]} Identifique, na classe \texttt{ConversionJob}, qual princípio SOLID está mais presente e explique, em poucas frases, por que ela \textbf{não} precisa de uma interface polimórfica como \texttt{IConsoleDetector}. É uma reflexão escrita, não gera código novo.
+    \item \textbf{[laboratório]} Compare, com um pequeno benchmark usando \texttt{<chrono>}, o tempo de inserção de 100.000 caminhos de arquivo em um \texttt{std::vector<std::string>} com \texttt{reserve()} previamente chamado versus sem \texttt{reserve()}. O programa de benchmark é descartável; o aprendizado (o motivo do \texttt{reserve()} no Módulo 7) é o que fica.
+\end{enumerate}
+\end{CaixaDesafio}
+
+\begin{CaixaResumo}
+Neste módulo você aprendeu:
+\begin{itemize}
+    \item Como os cinco princípios SOLID se aplicam, concretamente, ao RetroForge -- e que nem todo princípio precisa ser forçado em toda classe.
+    \item A arquitetura de pastas do projeto: separação entre \texttt{core/} (regra de negócio, dividido em \texttt{include/} e \texttt{src/}) e \texttt{cli/}/\texttt{gui/} (apresentação), com subpastas organizadas por área de responsabilidade (\texttt{io/}, \texttt{process/}, \texttt{identification/}, \texttt{models/}).
+    \item Por que \texttt{ios::binary} é obrigatório para qualquer leitura de ROM/ISO e como isso evita corrupção silenciosa de dados no Windows.
+    \item Como encapsular leitura binária posicionada e em blocos na classe \texttt{BinaryFileReader}, delegando o RAII ao \texttt{std::ifstream} interno.
+    \item Como \texttt{unique\_ptr} (com \textit{deleter} customizado, em \texttt{ExternalProcessHandle}), \texttt{shared\_ptr} (em \texttt{ConversionJob}) e \texttt{weak\_ptr} eliminam vazamentos de memória e de processos externos.
+    \item Como combinar \texttt{std::vector}, \texttt{unique\_ptr} e polimorfismo (\texttt{IConsoleDetector} + \texttt{ConsoleIdentifier} + detectores concretos) para construir um sistema de identificação de consoles aberto para extensão e fechado para modificação.
+    \item Por que o \texttt{enum class Console} vive sozinho em \texttt{models/Console.hpp}, em vez de ser redeclarado dentro de \texttt{ConversionJob.hpp} e de \texttt{IConsoleDetector.hpp} -- uma única fonte de verdade para o vocabulário de domínio mais usado do projeto, evitando que duas cópias divirjam silenciosamente quando um novo valor (Módulo 2) precisar ser adicionado.
+\end{itemize}
+
+Com essa fundação sólida -- em código \textbf{e} em arquitetura --, o Módulo 1 vai mostrar como o CMake orquestra exatamente essa estrutura de pastas (\texttt{core/}, \texttt{cli/}, e futuramente \texttt{gui/}), linkando as bibliotecas certas a cada alvo de compilação, exatamente como já está esboçado nos arquivos \texttt{CMakeLists.txt} atuais do repositório do RetroForge.
+\end{CaixaResumo}
