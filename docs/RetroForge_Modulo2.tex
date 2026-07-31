@@ -1,0 +1,920 @@
+\section{Módulo 2: O Motor de Identificação Universal (Zero-Hash Check)}
+
+O Módulo 0 já deixou pronta a espinha dorsal do Motor de Identificação: a interface \texttt{IConsoleDetector}, o orquestrador \texttt{ConsoleIdentifier} e uma primeira implementação concreta, \texttt{GameCubeDetector}. O Módulo 1 garantiu que qualquer arquivo \texttt{.cpp} novo dentro de \texttt{core/src/} entra automaticamente no build, graças ao \texttt{file(GLOB\_RECURSE ... CONFIGURE\_DEPENDS)}. Chegou a hora de usar essa base para construir o que a documentação chama de \textit{Zero-Hash Check} (Seção 3.1): identificar corretamente PS1, PS2, PSP e Dreamcast -- inclusive distinguindo um \texttt{.gdi} limpo de um \texttt{.cdi} modificado (Seção 3.1 da documentação v2.0 e US06) -- sem depender de nenhuma base de dados online.
+
+\begin{CaixaInfo}[title={O que já existe vs. o que este módulo constrói}]
+Já temos, do Módulo 0: \texttt{IConsoleDetector.hpp}, \texttt{ConsoleIdentifier.hpp/.cpp} e \texttt{detectors/GameCubeDetector.hpp/.cpp}, todos em \texttt{core/include(ou src)/retroforge/identification/}; e \texttt{models/Console.hpp}, a única fonte de verdade do \texttt{enum class Console}, reexportada por \texttt{IConsoleDetector.hpp} via \texttt{using}. Este módulo vai: (1) adicionar seis novos detectores binários (\texttt{Ps1Detector}, \texttt{Ps2Detector}, \texttt{PspDetector}, \texttt{PbpDetector}, \texttt{SegaCdDetector} e \texttt{SegaSaturnDetector}, contando o \texttt{GameCubeDetector} já pronto), (2) introduzir \textbf{duas} interfaces novas, não uma: \texttt{IContainerDetector} para formatos de contêiner \textbf{decisivos} (\texttt{.gdi}, \texttt{.cdi} -- a extensão sozinha já basta) e \texttt{IContainerResolver} para formatos de contêiner \textbf{ambíguos} (\texttt{.cue} -- a extensão sozinha \textbf{não} decide nada, precisa ser resolvida até um binário real e confirmada por assinatura), e (3) \textbf{revisar} o \texttt{ConsoleIdentifier} para orquestrar os três mecanismos juntos. Um projeto que este módulo \textbf{descarta} em relação a uma primeira versão possível: um \texttt{Ps1CueDetector} que decidiria ``PS1'' só de ver a extensão \texttt{.cue}. Essa abordagem simples demais tem um problema real -- Sega CD e Saturn também usam pares \texttt{.cue}/\texttt{.bin} -- e por isso não faz parte do design final deste módulo. Vamos explicar exatamente por quê, e como resolvemos isso.
+\end{CaixaInfo}
+
+\subsection{Zero-Hash: o que significa na prática}
+
+A filosofia ``Offline-First'' da documentação estabelece que o RetroForge nunca precisa consultar a internet, nem calcular um hash criptográfico do arquivo inteiro, só para saber \textit{qual console} é aquele arquivo. Isso é diferente do Scraper (Módulo 5), que \textbf{também} usa hashing -- mas com outro propósito (renomear o arquivo com base em um banco de dados de \textit{clean dumps}). São duas responsabilidades completamente distintas, resolvidas por classes completamente distintas: o Motor de Identificação (este módulo) nunca vai depender do Scraper, nem o contrário.
+
+\begin{CaixaAlerta}
+É tentador, ao ouvir ``identificar um arquivo'', pensar em calcular um hash (MD5, SHA-1, xxHash) e comparar contra uma tabela. \textbf{Não é isso que este módulo faz.} Calcular um hash de um arquivo de 4,7 GB, mesmo em blocos (Módulo 0, Seção de \textit{chunks}), ainda exige ler o arquivo inteiro do disco -- caro, e desnecessário só para saber ``isso é um jogo de PS2''. O Zero-Hash Check lê apenas os primeiros kilobytes do arquivo. É ordens de magnitude mais rápido, e funciona até para romhacks e traduções de fã, que nunca vão bater com nenhuma hash de um banco de dados online (US02).
+\end{CaixaAlerta}
+
+\subsection{Três formas de identificação, não duas: binária, contêiner decisivo e contêiner ambíguo}
+\label{sec:tres-formas}
+
+A primeira tentativa de projetar este módulo enxerga apenas dois casos: ``arquivos onde olhamos para dentro'' (GameCube, PS2, PSP -- bytes de cabeçalho) e ``arquivos onde a extensão já basta'' (\texttt{.cue} para PS1, \texttt{.gdi}/\texttt{.cdi} para Dreamcast). Essa segunda categoria, porém, esconde uma armadilha: \textbf{nem todo contêiner de texto é decisivo}.
+
+\begin{itemize}
+    \item \textbf{\texttt{.gdi} e \texttt{.cdi} são, na prática, formatos exclusivos de Dreamcast.} Ninguém mais usa esses dois formatos de contêiner. Ver a extensão \texttt{.gdi} já é prova suficiente de que se trata de um Dreamcast -- não existe ambiguidade real a resolver.
+    \item \textbf{\texttt{.cue} \textbf{não} é exclusivo de nenhum console.} É um formato genérico de \textit{cue sheet}, usado por qualquer sistema baseado em CD com múltiplas trilhas -- PS1, mas também Sega CD e Saturn (Seção 2 da documentação v2.0 já lista os três como rotas de \texttt{chdman}). Um detector que decidisse ``PS1'' só de ver \texttt{.cue} estaria cometendo exatamente o mesmo erro estrutural que motivou o projeto inteiro (ver \textit{Motivação e História}): confiar cegamente em uma pista superficial sem confirmar o conteúdo real.
+\end{itemize}
+
+\begin{CaixaAlerta}
+Isto não é um detalhe acadêmico. Se o RetroForge classificasse todo \texttt{.cue} como PS1, um usuário com uma coleção de Sega CD (US08: ``selecionar um HD inteiro e deixar o programa decidir sozinho'') receberia recomendações de compressão e avisos de emulação \textbf{errados} para cada jogo de Sega CD -- e, se algum dia PS1 e Sega CD precisarem de tratamentos diferentes no \texttt{CompressionRouter} (Módulo 3), o erro deixa de ser cosmético. A extensão \texttt{.cue} é um \textbf{candidato}, nunca uma \textbf{confirmação}.
+\end{CaixaAlerta}
+
+A solução é reconhecer que existem \textbf{três} estratégias de identificação genuinamente diferentes, cada uma com seu próprio contrato:
+
+\begin{center}
+\begin{tabular}{|>{\ttfamily}l|p{3.3cm}|p{6.8cm}|}
+\hline
+\textbf{Interface} & \textbf{Quando usar} & \textbf{Exemplos} \\
+\hline
+IConsoleDetector & Assinatura binária confirma sozinha & GameCube (offset fixo), PS1/PS2/PSP/Sega CD/Saturn (busca de substring) \\
+\hline
+IContainerDetector & Extensão sozinha já é decisiva & Dreamcast limpo (\texttt{.gdi}), Dreamcast modificado (\texttt{.cdi}) \\
+\hline
+IContainerResolver & Extensão \textbf{não} decide -- resolve para um binário real, que então passa pela linha de cima & PS1/Sega CD/Saturn (\texttt{.cue} $\rightarrow$ \texttt{.bin}) \\
+\hline
+\end{tabular}
+\end{center}
+
+\texttt{IConsoleDetector} e \texttt{IContainerDetector} já existiam neste módulo (ou seriam introduzidos exatamente como antes). O que muda é a terceira linha da tabela -- e é sobre ela que o restante desta seção se debruça.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{IContainerDetector} existe:} representa o contrato mínimo para estratégias de identificação baseadas no \textbf{caminho/extensão} do arquivo, quando essa extensão sozinha já é prova suficiente. Segue Segregação de Interface (só dois métodos) e permite múltiplas implementações intercambiáveis (Substituição de Liskov).
+    \item \textbf{Como se comunica com outras classes:} implementada por \texttt{DreamcastGdiDetector} e \texttt{DreamcastCdiDetector} (uma classe por formato de contêiner decisivo); consumida exclusivamente pelo \texttt{ConsoleIdentifier} revisado desta seção -- nunca diretamente pela camada de apresentação.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/identification/IContainerDetector.hpp}, ao lado (mas não misturada) do já existente \texttt{IConsoleDetector.hpp}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/IContainerDetector.hpp
+#pragma once
+
+#include <filesystem>
+
+#include "retroforge/identification/IConsoleDetector.hpp" // reaproveita o enum Console
+
+namespace retroforge::identification {
+
+// Responsabilidade unica: decidir se um CAMINHO (extensao/nome de arquivo)
+// corresponde, SOZINHO, a um formato de conteiner DECISIVO (.gdi, .cdi).
+// Nunca abre nem le bytes do arquivo. Diferente de IContainerResolver
+// (introduzida nesta secao), que existe justamente para os casos em que
+// a extensao NAO e' suficiente.
+class IContainerDetector {
+public:
+    virtual ~IContainerDetector() = default;
+    virtual bool matches(const std::filesystem::path& caminho) const = 0;
+    virtual Console console() const = 0;
+};
+
+} // namespace retroforge::identification
+\end{CaixaCodigo}
+
+\subsection{Ampliando o vocabulário: três novos valores no \texttt{enum class Console}}
+
+A Seção 3.1 da documentação v2.0 exige mais do que identificar \textit{qual console} -- para o Dreamcast, precisamos também identificar se o \textbf{dump é seguro para conversão automática}; e, ao resolver a ambiguidade do \texttt{.cue} (Seção~\ref{sec:tres-formas}), precisamos de vocabulário para os dois consoles que a documentação já lista como rotas de \texttt{chdman} (Seção 2 da documentação v2.0) mas que o Motor de Identificação ainda não sabia reconhecer: \textbf{Sega CD} e \textbf{Saturn}.
+
+Além disso -- e esta é uma extensão que a documentação original ainda não previa, mas que a prática de implementar o motor revelou ser necessária --, o PSP tem o mesmo tipo de armadilha que o Dreamcast já tinha: nem todo arquivo de PSP é um \texttt{.iso} cru. É comum encontrar jogos de PSP já empacotados como \texttt{EBOOT.PBP} -- um contêiner próprio da Sony, usado tanto para homebrews quanto para instalações completas de jogo, que já embute seus próprios dados de forma processada. Tratar um \texttt{.pbp} como se fosse um \texttt{.iso} bruto e mandá-lo para o mesmo caminho de compressão do PSP normal (\texttt{maxcso}, Módulo 3) é, estruturalmente, o mesmo erro que motivou o projeto inteiro com o \texttt{.cdi} de Dreamcast -- só que desta vez com PSP. Por isso, \texttt{PSP\_PBP} nasce como um valor \textbf{distinto} de \texttt{PSP} no vocabulário, não como um caso especial escondido dentro do mesmo valor.
+
+Como já estabelecido no Módulo 0, esse vocabulário tem uma única fonte de verdade -- \texttt{core/include/retroforge/models/Console.hpp}. Adicionamos os novos valores lá, como extensões estritamente aditivas, exatamente como o próprio \texttt{DreamcastModificado} foi adicionado.
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/models/Console.hpp
+
+namespace retroforge::models {
+
+// Vocabulario de dominio puro -- unica fonte de verdade do projeto para
+// este tipo (ver Modulo 0). Nenhuma outra area do sistema declara sua
+// propria copia deste enum.
+enum class Console {
+    Dreamcast,           // .gdi -- dump limpo, seguro para o chdman
+    DreamcastModificado, // .cdi -- BLOQUEADO no Modulo 3, nunca convertido
+    GameCube,
+    MegaDrive,
+    PS1,
+    PS2,
+    PSP_PBP,             // .pbp/EBOOT -- ja empacotado; BLOQUEADO no Modulo 3,
+                         // nao deve ser recomprimido as cegas (ver CaixaAlerta)
+    PSP,                 // .iso cru -- seguro para o maxcso
+    Saturn,              // identificado via .cue resolvido + assinatura
+    SegaCD,              // identificado via .cue resolvido + assinatura
+    SNES,
+    Desconhecido
+};
+
+} // namespace retroforge::models
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+Repare o paralelo exato com \texttt{DreamcastModificado}: assim como \texttt{.cdi} e \texttt{.gdi} são ambos ``Dreamcast'', mas apenas um é seguro para o \texttt{chdman}, \texttt{PSP\_PBP} e \texttt{PSP} são ambos ``PSP'', mas apenas o segundo deveria ir para o \texttt{maxcso}. A tentação de tratar \texttt{PSP\_PBP} como um simples ``\texttt{PSP} com bandeira extra'' dentro do próprio \texttt{ConversionJob} ou do \texttt{CompressionRouter} é exatamente o tipo de atalho que reintroduziria, de forma disfarçada, o bug motivador do projeto -- só que agora silenciosamente, sem nenhum erro de compilação para avisar. Por isso o valor ganha sua própria entrada no enum, e não um campo booleano adicional em algum lugar.
+\end{CaixaAlerta}
+
+\begin{CaixaInfo}
+Assim como \texttt{DreamcastModificado} obrigou o compilador (com \texttt{-Wswitch}) a forçar qualquer \texttt{switch} futuro sobre \texttt{Console} a tratar aquele caso, \texttt{SegaCD}, \texttt{Saturn} \textbf{e} \texttt{PSP\_PBP} fazem o mesmo pelo \texttt{CompressionRouter} do Módulo 3: assim que este módulo terminar, o Módulo 3 \textbf{precisa} decidir explicitamente para onde rotear (ou bloquear) cada um desses valores -- não é possível ``esquecer'' silenciosamente um console novo quando o vocabulário inteiro do projeto vive em um único enum. Diferente de \texttt{SegaCD}/\texttt{Saturn} (que ganham uma rota real para \texttt{chdman}), \texttt{PSP\_PBP} vai precisar do mesmo tratamento de trava explícita que \texttt{DreamcastModificado} recebeu -- isso é trabalho do Módulo 3, não deste módulo, mas o vocabulário já está pronto para que essa decisão seja tomada corretamente quando chegar a hora.
+\end{CaixaInfo}
+
+\subsection{Detectores de contêiner decisivos: Dreamcast limpo e modificado}
+
+Estes dois detectores não mudam em relação ao design original -- eles são exatamente o caso em que a extensão, sozinha, já é prova suficiente (Seção~\ref{sec:tres-formas}), e é justamente essa simplicidade que evidencia por que o \textit{bug} motivador do projeto (a história descrita na Motivação, tentar comprimir um \texttt{.cdi} com o \texttt{chdman}) nunca mais deveria acontecer no RetroForge: a decisão ``isso é seguro'' vs.\ ``isso é perigoso'' acontece \textbf{antes} de qualquer processo externo ser invocado, só de olhar para a extensão do arquivo.
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/detectors/DreamcastGdiDetector.hpp
+#pragma once
+
+#include "retroforge/identification/IContainerDetector.hpp"
+
+namespace retroforge::identification::detectors {
+
+// Dump limpo de Dreamcast: arquivo texto listando trilhas (.gdi).
+// Seguro para seguir automaticamente para o chdman (Modulo 3).
+class DreamcastGdiDetector : public IContainerDetector {
+public:
+    bool matches(const std::filesystem::path& caminho) const override {
+        return caminho.extension() == ".gdi";
+    }
+    Console console() const override { return Console::Dreamcast; }
+};
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/detectors/DreamcastCdiDetector.hpp
+#pragma once
+
+#include "retroforge/identification/IContainerDetector.hpp"
+
+namespace retroforge::identification::detectors {
+
+// Rip/dump MODIFICADO de Dreamcast (.cdi). Console::DreamcastModificado
+// e' um valor de enum DELIBERADAMENTE distinto de Console::Dreamcast --
+// o Modulo 3 vai bloquear a conversao para este valor (US06).
+class DreamcastCdiDetector : public IContainerDetector {
+public:
+    bool matches(const std::filesystem::path& caminho) const override {
+        return caminho.extension() == ".cdi";
+    }
+    Console console() const override { return Console::DreamcastModificado; }
+};
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Por que não existe um \texttt{DreamcastDetector} único, com um \texttt{if/else} interno decidindo entre \texttt{.gdi} e \texttt{.cdi}? Porque isso violaria a Responsabilidade Única -- uma classe passaria a ter \textbf{dois} motivos para mudar. Duas classes de uma linha cada são mais fáceis de testar isoladamente (Módulo 12) do que uma classe com lógica ramificada.
+\end{CaixaInfo}
+
+\subsection{Contêineres ambíguos: o \texttt{IContainerResolver} e o \texttt{CueSheetResolver}}
+\label{sec:resolver}
+
+Diferente de \texttt{.gdi}/\texttt{.cdi}, um arquivo \texttt{.cue} não carrega, na sua extensão, informação suficiente para decidir o console. O que ele carrega é uma lista de \textbf{trilhas}, referenciando um ou mais arquivos binários (tipicamente um único \texttt{.bin}). A pergunta certa não é ``que console é este \texttt{.cue}?'', mas sim ``para \textbf{qual arquivo binário} este \texttt{.cue} aponta, para que possamos aplicar a mesma detecção por assinatura que já usamos em \texttt{.iso}?''.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{IContainerResolver} existe:} é o contrato mínimo (Segregação de Interface) para estratégias que reconhecem um formato de contêiner \textbf{ambíguo} e o resolvem para o binário real que precisa ser inspecionado. Diferente de \texttt{IContainerDetector}, ela \textbf{nunca} devolve um \texttt{Console} -- só devolve, no máximo, um \texttt{std::filesystem::path}. A decisão final sobre o console continua sendo, propositalmente, responsabilidade exclusiva dos detectores binários (\texttt{IConsoleDetector}).
+    \item \textbf{Como se comunica com outras classes:} implementada por \texttt{CueSheetResolver}; consumida exclusivamente pelo \texttt{ConsoleIdentifier} revisado adiante, que usa o caminho resolvido para abrir um \texttt{BinaryFileReader} e rodar os detectores binários normalmente -- \texttt{CueSheetResolver} nunca chama \texttt{IConsoleDetector} diretamente, essa orquestração pertence só ao \texttt{ConsoleIdentifier}.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/identification/IContainerResolver.hpp}, ao lado de \texttt{IContainerDetector.hpp} e \texttt{IConsoleDetector.hpp} -- as três interfaces do Motor de Identificação, lado a lado.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/IContainerResolver.hpp
+#pragma once
+
+#include <filesystem>
+#include <optional>
+
+namespace retroforge::identification {
+
+// Responsabilidade unica: reconhecer um formato de conteiner cuja extensao,
+// SOZINHA, nao e' suficiente para determinar o console (ex: .cue e' usado
+// por PS1, Sega CD e Saturn) -- e resolver esse caminho para o arquivo
+// binario real que precisa ser inspecionado para confirmar a identificacao.
+// NUNCA devolve um Console -- devolve, no maximo, um caminho. A decisao
+// final continua sendo dos detectores binarios de sempre.
+class IContainerResolver {
+public:
+    virtual ~IContainerResolver() = default;
+
+    // Retorna o caminho do arquivo binario real referenciado por 'caminho',
+    // ou std::nullopt se este resolver nao reconhece a extensao recebida,
+    // ou se a resolucao falhar (arquivo sem linha FILE reconhecivel).
+    virtual std::optional<std::filesystem::path>
+    resolve(const std::filesystem::path& caminho) const = 0;
+};
+
+} // namespace retroforge::identification
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/detectors/CueSheetResolver.hpp
+#pragma once
+
+#include "retroforge/identification/IContainerResolver.hpp"
+
+namespace retroforge::identification::detectors {
+
+// Reconhece arquivos .cue e resolve para o .bin referenciado na linha
+// "FILE \"...\" BINARY". NAO decide console nenhum -- so' sabe abrir um
+// arquivo de TEXTO (a cue sheet) e extrair um nome de arquivo referenciado.
+class CueSheetResolver : public IContainerResolver {
+public:
+    std::optional<std::filesystem::path>
+    resolve(const std::filesystem::path& caminho) const override;
+};
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/identification/detectors/CueSheetResolver.cpp
+#include "retroforge/identification/detectors/CueSheetResolver.hpp"
+
+#include <fstream>
+#include <string>
+
+namespace retroforge::identification::detectors {
+
+std::optional<std::filesystem::path>
+CueSheetResolver::resolve(const std::filesystem::path& caminho) const {
+    if (caminho.extension() != ".cue") {
+        return std::nullopt;
+    }
+
+    std::ifstream cue_sheet(caminho);
+    if (!cue_sheet.is_open()) {
+        return std::nullopt;
+    }
+
+    std::string linha;
+    while (std::getline(cue_sheet, linha)) {
+        auto pos_file = linha.find("FILE");
+        if (pos_file == std::string::npos) {
+            continue; // linhas de INDEX, TRACK etc. nao nos interessam aqui
+        }
+
+        auto primeira_aspa = linha.find('"', pos_file);
+        if (primeira_aspa == std::string::npos) {
+            continue;
+        }
+
+        auto segunda_aspa = linha.find('"', primeira_aspa + 1);
+        if (segunda_aspa == std::string::npos) {
+            continue;
+        }
+
+        std::string nome_bin =
+            linha.substr(primeira_aspa + 1, segunda_aspa - primeira_aspa - 1);
+
+        // Resolvido relativo a PASTA do proprio .cue -- nunca ao diretorio
+        // de trabalho do processo. Essencial para a varredura recursiva
+        // (Modulo 7), onde o .cue pode estar em qualquer subpasta do HD.
+        return caminho.parent_path() / nome_bin;
+    }
+
+    return std::nullopt; // .cue sem nenhuma linha FILE reconhecivel
+}
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+Note o que \texttt{CueSheetResolver} \textbf{não} faz: ele não abre o \texttt{.bin}, não lê um único byte binário, e não tenta adivinhar o console. Sua única responsabilidade termina no momento em que devolve um \texttt{std::filesystem::path}. Isso é Responsabilidade Única levada a sério -- se amanhã o formato de \textit{cue sheet} precisar de um parser mais robusto (múltiplas trilhas, comentários, variações de formatação entre ferramentas de \textit{ripping}), só esta classe muda. Nenhum detector binário, nem o \texttt{ConsoleIdentifier}, precisa saber que esse parsing ficou mais sofisticado.
+\end{CaixaAlerta}
+
+\subsection{Discos ópticos por assinatura binária: PS1 vs.\ PS2, e a chegada de Sega CD e Saturn}
+
+Com o caminho binário resolvido (seja um \texttt{.iso} direto, seja um \texttt{.bin} apontado por um \texttt{.cue}), falta a parte que realmente confirma o console: os detectores binários. GameCube já está pronto desde o Módulo 0 (offset fixo). PS2 e PSP usam busca de substring -- mas aqui aparece uma armadilha que só se manifesta agora que PS1 também passou a ser confirmado por assinatura binária, em vez de só pela extensão \texttt{.cue}.
+
+\begin{CaixaAlerta}
+\textbf{PS1 e PS2 compartilham o mesmo arquivo de sistema.} Ambos os consoles usam um arquivo chamado \texttt{SYSTEM.CNF} na raiz do disco para declarar o executável de boot -- a diferença está em \textbf{como} esse executável é declarado dentro do arquivo: discos de PS1 usam a chave \texttt{BOOT = ...}; discos de PS2 usam \texttt{BOOT2 = ...}. Um detector que procurasse apenas \texttt{"SYSTEM.CNF"} (como a primeira versão deste módulo fazia para PS2) daria \textbf{falso positivo} em qualquer disco de PS1 resolvido via \texttt{CueSheetResolver}. Por isso, \texttt{Ps2Detector} precisa ser revisado nesta seção -- não é um erro do Módulo 2 anterior, é uma consequência direta de agora confirmarmos PS1 por assinatura em vez de confiar cegamente na extensão \texttt{.cue}.
+\end{CaixaAlerta}
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{Ps1Detector} existe:} confirma, via assinatura binária, que um arquivo resolvido (tipicamente a partir de um \texttt{.cue}) é de fato um PS1 -- presença de \texttt{SYSTEM.CNF} \textbf{e} ausência de \texttt{BOOT2}.
+    \item \textbf{Como se comunica com outras classes:} implementa \texttt{IConsoleDetector}, exatamente como \texttt{Ps2Detector} e \texttt{PspDetector}; é registrado no \texttt{ConsoleIdentifier} e testado na Fase 3 (assinatura binária), tanto sobre \texttt{.iso} diretos quanto sobre \texttt{.bin} resolvidos pelo \texttt{CueSheetResolver}.
+    \item \textbf{Onde mora:} \texttt{core/include/retroforge/identification/detectors/Ps1Detector.hpp} e \texttt{core/src/identification/detectors/Ps1Detector.cpp}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/detectors/Ps1Detector.hpp
+#pragma once
+
+#include "retroforge/identification/IConsoleDetector.hpp"
+
+namespace retroforge::identification::detectors {
+
+// PS1 e PS2 compartilham SYSTEM.CNF na raiz do disco -- a diferenca esta
+// em COMO o executavel de boot e' declarado: PS1 usa "BOOT =", PS2 usa
+// "BOOT2 =". Por isso exige SYSTEM.CNF presente E BOOT2 ausente (ver
+// Ps2Detector, revisado nesta mesma secao, para a regra espelhada).
+class Ps1Detector : public IConsoleDetector {
+public:
+    bool matches(const std::vector<uint8_t>& cabecalho) const override;
+    Console console() const override { return Console::PS1; }
+};
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/identification/detectors/Ps1Detector.cpp
+#include "retroforge/identification/detectors/Ps1Detector.hpp"
+
+#include <algorithm>
+#include <string_view>
+
+namespace retroforge::identification::detectors {
+
+bool Ps1Detector::matches(const std::vector<uint8_t>& cabecalho) const {
+    static constexpr std::string_view SYSTEM_CNF = "SYSTEM.CNF";
+    static constexpr std::string_view MARCADOR_PS2 = "BOOT2";
+
+    bool tem_system_cnf = std::search(cabecalho.begin(), cabecalho.end(), SYSTEM_CNF.begin(),
+                                       SYSTEM_CNF.end()) != cabecalho.end();
+
+    bool tem_boot2 = std::search(cabecalho.begin(), cabecalho.end(), MARCADOR_PS2.begin(),
+                                  MARCADOR_PS2.end()) != cabecalho.end();
+
+    return tem_system_cnf && !tem_boot2;
+}
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/identification/detectors/Ps2Detector.cpp
+// (REVISADO neste modulo -- ver CaixaAlerta desta secao para o motivo)
+#include "retroforge/identification/detectors/Ps2Detector.hpp"
+
+#include <algorithm>
+#include <string_view>
+
+namespace retroforge::identification::detectors {
+
+bool Ps2Detector::matches(const std::vector<uint8_t>& cabecalho) const {
+    // SYSTEM.CNF sozinho NAO basta -- PS1 tambem o possui. BOOT2 e'
+    // o marcador exclusivo do PS2 (ver Ps1Detector, regra espelhada).
+    static constexpr std::string_view SYSTEM_CNF = "SYSTEM.CNF";
+    static constexpr std::string_view MARCADOR_PS2 = "BOOT2";
+
+    bool tem_system_cnf = std::search(cabecalho.begin(), cabecalho.end(), SYSTEM_CNF.begin(),
+                                       SYSTEM_CNF.end()) != cabecalho.end();
+
+    bool tem_boot2 = std::search(cabecalho.begin(), cabecalho.end(), MARCADOR_PS2.begin(),
+                                  MARCADOR_PS2.end()) != cabecalho.end();
+
+    return tem_system_cnf && tem_boot2;
+}
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Diferente do PS1/PS2, \texttt{PspDetector} nunca teve risco de colisão com \texttt{SYSTEM.CNF}/\texttt{BOOT2} -- sua assinatura (\texttt{"UMD\_DATA.BIN"}) é exclusiva do formato de UMD da Sony. Ainda assim, formalizamos a classe no corpo do texto agora (em vez de deixá-la como exercício), porque ela precisa conviver, nesta seção, com sua irmã \texttt{PbpDetector} -- veja a seguir por que as duas precisam ser detectores \textbf{distintos}, apesar de ambas representarem ``um arquivo de PSP''.
+\end{CaixaInfo}
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{PspDetector} existe:} confirma, via assinatura binária, que um \texttt{.iso} é de fato um UMD de PSP cru -- o caso seguro, que segue para o \texttt{maxcso} no Módulo 3.
+    \item \textbf{Como se comunica com outras classes:} implementa \texttt{IConsoleDetector}, exatamente como os demais detectores desta seção; é registrado no \texttt{ConsoleIdentifier} pela \texttt{IdentificationEngineFactory} (Seção~\ref{sec:engine-factory}).
+    \item \textbf{Onde mora:} \texttt{core/include/retroforge/identification/detectors/PspDetector.hpp} e seu \texttt{.cpp} correspondente.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/detectors/PspDetector.hpp
+#pragma once
+
+#include "retroforge/identification/IConsoleDetector.hpp"
+
+namespace retroforge::identification::detectors {
+
+// Confirma um UMD de PSP cru (.iso), via assinatura binaria. Distinto de
+// PbpDetector (ver a seguir) -- um .iso e' seguro para o maxcso; um .pbp
+// NAO e', ver Console::PSP_PBP.
+class PspDetector : public IConsoleDetector {
+public:
+    bool matches(const std::vector<uint8_t>& cabecalho) const override;
+    Console console() const override { return Console::PSP; }
+};
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/identification/detectors/PspDetector.cpp
+#include "retroforge/identification/detectors/PspDetector.hpp"
+
+#include <algorithm>
+#include <string_view>
+
+namespace retroforge::identification::detectors {
+
+bool PspDetector::matches(const std::vector<uint8_t>& cabecalho) const {
+    static constexpr std::string_view UMD_DATA = "UMD_DATA.BIN";
+
+    if (cabecalho.empty()) {
+        return false;
+    }
+
+    return std::search(cabecalho.begin(), cabecalho.end(), UMD_DATA.begin(),
+                        UMD_DATA.end()) != cabecalho.end();
+}
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\subsubsection{O irmão perigoso do PSP: \texttt{PbpDetector} e o formato \texttt{EBOOT.PBP}}
+\label{sec:pbp-detector}
+
+Nem todo arquivo de PSP é um \texttt{.iso} cru. É extremamente comum encontrar jogos e homebrews de PSP empacotados como \texttt{EBOOT.PBP} -- um contêiner binário próprio da Sony, que embute o executável, ícones, metadados e, em muitos casos, dados já processados de forma incompatível com uma recompressão direta via \texttt{maxcso}. Identificar um \texttt{.pbp} como se fosse ``apenas mais um PSP'' e mandá-lo para a mesma rota de compressão do \texttt{.iso} cru seria, estruturalmente, \textbf{o mesmo erro} que motivou o projeto inteiro com o \texttt{.cdi} de Dreamcast (ver \textit{Motivação e História do Projeto}) -- só que desta vez escondido atrás de uma extensão diferente, em vez de um formato de disco diferente.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{PbpDetector} existe:} confirma, via assinatura binária, que um arquivo é um contêiner \texttt{EBOOT.PBP} -- e devolve, deliberadamente, um valor de \texttt{Console} \textbf{distinto} (\texttt{PSP\_PBP}), nunca \texttt{Console::PSP}. A distinção existe para que o Módulo 3 tenha, no vocabulário, informação suficiente para bloquear essa rota explicitamente -- exatamente como fez com \texttt{DreamcastModificado}.
+    \item \textbf{Como se comunica com outras classes:} implementa \texttt{IConsoleDetector}, é registrado no \texttt{ConsoleIdentifier} pela \texttt{IdentificationEngineFactory}, e roda na mesma Fase 3 (assinatura binária) que \texttt{PspDetector} -- a ordem de registro entre os dois não importa, porque as assinaturas (\texttt{"UMD\_DATA.BIN"} vs.\ o \textit{magic number} \texttt{\textbackslash 0PBP}) nunca colidem no mesmo arquivo.
+    \item \textbf{Onde mora:} \texttt{core/include/retroforge/identification/detectors/PbpDetector.hpp} e seu \texttt{.cpp} correspondente -- lado a lado com \texttt{PspDetector}, porque ambos pertencem à mesma área de responsabilidade (identificação de arquivos de PSP), apesar de produzirem valores de \texttt{Console} diferentes.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/detectors/PbpDetector.hpp
+#pragma once
+
+#include "retroforge/identification/IConsoleDetector.hpp"
+
+namespace retroforge::identification::detectors {
+
+// Confirma um conteiner EBOOT.PBP (jogo/homebrew de PSP JA EMPACOTADO).
+// Console::PSP_PBP e' um valor de enum DELIBERADAMENTE distinto de
+// Console::PSP -- o Modulo 3 vai bloquear a conversao para este valor,
+// no mesmo espirito de Console::DreamcastModificado (Secao anterior).
+class PbpDetector : public IConsoleDetector {
+public:
+    bool matches(const std::vector<uint8_t>& cabecalho) const override;
+    Console console() const override { return Console::PSP_PBP; }
+};
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/identification/detectors/PbpDetector.cpp
+#include "retroforge/identification/detectors/PbpDetector.hpp"
+
+namespace retroforge::identification::detectors {
+
+bool PbpDetector::matches(const std::vector<uint8_t>& cabecalho) const {
+    if (cabecalho.size() < 4) {
+        return false;
+    }
+
+    // Magic number do formato PBP: bytes 0x00 'P' 'B' 'P' no inicio do
+    // arquivo -- documentado publicamente pela comunidade de homebrew de
+    // PSP, sem relacao com nenhum offset usado pelos demais detectores.
+    return cabecalho[0] == 0x00 && cabecalho[1] == 0x50 && // 'P'
+           cabecalho[2] == 0x42 &&                         // 'B'
+           cabecalho[3] == 0x50;                            // 'P'
+}
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+Assim como a trava de \texttt{DreamcastModificado} no \texttt{CompressionRouter} (Módulo 3) precisa ser um \texttt{if} explícito, checado \textbf{antes} de qualquer consulta ao mapa de estratégias -- e não apenas ``a ausência de uma rota registrada'' --, \texttt{PSP\_PBP} vai precisar exatamente do mesmo tratamento quando o Módulo 3 for revisitado. Deixar \texttt{PSP\_PBP} apenas \textbf{sem rota registrada} já é seguro por padrão (o roteador devolve \texttt{ConsoleNaoSuportado} em vez de tentar comprimir), mas não é \textbf{à prova de erro humano}: um futuro contribuidor (Módulo 14), vendo ``PSP'' no nome do valor, poderia registrar o \texttt{MaxcsoConverter} também para \texttt{PSP\_PBP} ``para não deixar nenhum console sem rota'' -- reintroduzindo exatamente o bug motivador do projeto, desta vez com PSP. Guardamos esse alerta aqui, no módulo que introduziu o valor, para que a decisão já esteja documentada quando o Módulo 3 for revisado.
+\end{CaixaAlerta}
+
+Com PS1, PS2 e os dois casos de PSP devidamente resolvidos, faltam os dois consoles que a documentação v2.0 já lista como rotas de \texttt{chdman} (Seção 2) mas que o Motor de Identificação ainda não sabia reconhecer: Sega CD e Saturn. Ambos têm assinaturas próprias no setor de \textit{boot} do disco, sem nenhum risco de colisão com PS1/PS2/GameCube.
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/detectors/SegaCdDetector.hpp
+#pragma once
+
+#include "retroforge/identification/IConsoleDetector.hpp"
+
+namespace retroforge::identification::detectors {
+
+// Discos de Sega CD/Mega-CD trazem a assinatura "SEGADISCSYSTEM" no
+// setor de boot (IP.BIN), independente de regiao.
+class SegaCdDetector : public IConsoleDetector {
+public:
+    bool matches(const std::vector<uint8_t>& cabecalho) const override;
+    Console console() const override { return Console::SegaCD; }
+};
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/identification/detectors/SegaCdDetector.cpp
+#include "retroforge/identification/detectors/SegaCdDetector.hpp"
+
+#include <cstring>
+
+namespace retroforge::identification::detectors {
+
+bool SegaCdDetector::matches(const std::vector<uint8_t>& cabecalho) const {
+    // A assinatura "SEGADISCSYSTEM" pode aparecer no inicio absoluto do
+    // setor de boot (offset 0) ou, em alguns dumps, deslocada por um
+    // cabecalho de 16 bytes -- por isso checamos os dois offsets.
+    if (cabecalho.size() < 16) {
+        return false;
+    }
+
+    if (std::memcmp(cabecalho.data(), "SEGADISCSYSTEM", 14) == 0) {
+        return true;
+    }
+
+    if (cabecalho.size() >= 32 && std::memcmp(cabecalho.data() + 16, "SEGADISCSYSTEM", 14) == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\subsubsection{\texttt{SegaSaturnDetector}}
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{SegaSaturnDetector} existe:} confirma, via assinatura binária, que um disco resolvido (direto ou via \texttt{CueSheetResolver}) é de fato um Saturn -- estruturalmente idêntico ao \texttt{SegaCdDetector} acima, só trocando a assinatura procurada.
+    \item \textbf{Como se comunica com outras classes:} implementa \texttt{IConsoleDetector}; é registrado no \texttt{ConsoleIdentifier} pela \texttt{IdentificationEngineFactory}, na Fase 3, junto aos demais detectores binários.
+    \item \textbf{Onde mora:} \texttt{core/include/retroforge/identification/detectors/SegaSaturnDetector.hpp} e seu \texttt{.cpp} correspondente. O nome usa o prefixo \texttt{Sega} -- em vez de apenas \texttt{Saturn} -- para ficar consistente com \texttt{SegaCdDetector}, já que ambos são plataformas da mesma fabricante identificadas pelo mesmo mecanismo.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/detectors/SegaSaturnDetector.hpp
+#pragma once
+
+#include "retroforge/identification/IConsoleDetector.hpp"
+
+namespace retroforge::identification::detectors {
+
+class SegaSaturnDetector : public IConsoleDetector {
+public:
+    bool matches(const std::vector<uint8_t>& cabecalho) const override;
+    Console console() const override { return Console::Saturn; }
+};
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/identification/detectors/SegaSaturnDetector.cpp
+#include "retroforge/identification/detectors/SegaSaturnDetector.hpp"
+
+#include <cstring>
+
+namespace retroforge::identification::detectors {
+
+bool SegaSaturnDetector::matches(const std::vector<uint8_t>& cabecalho) const {
+    if (cabecalho.size() < 16) {
+        return false;
+    }
+
+    if (std::memcmp(cabecalho.data(), "SEGASATURN", 10) == 0) {
+        return true;
+    }
+
+    if (cabecalho.size() >= 32 && std::memcmp(cabecalho.data() + 16, "SEGASATURN", 10) == 0) {
+        return true;
+    }
+
+    return false;
+}
+
+} // namespace retroforge::identification::detectors
+\end{CaixaCodigo}
+
+\subsection{Revisando o \texttt{ConsoleIdentifier}: três fases, não duas}
+
+Esta continua sendo a mudança mais importante do módulo -- só que agora com uma fase a mais do que a primeira revisão previa. O \texttt{ConsoleIdentifier} precisa: (1) testar primeiro os detectores de \textbf{contêiner decisivo} (\texttt{.gdi}/\texttt{.cdi}); (2) testar, em seguida, os \textbf{resolvedores de contêiner ambíguo} (\texttt{.cue}), que -- se reconhecerem a extensão -- substituem o caminho a ser inspecionado por um caminho binário real; e só então (3) abrir o arquivo (o original, ou o resolvido) e testar os detectores \textbf{binários}, na ordem em que foram registrados.
+
+\begin{itemize}
+    \item \textbf{Por que essa ordem importa:} contêiner decisivo é o mais barato (nem olha para o disco) e o mais confiável quando aplicável -- checamos primeiro. Contêiner ambíguo é o próximo mais barato (abre um arquivo de texto pequeno, não o binário gigante) -- checamos em seguida, só para descobrir \textbf{qual} binário inspecionar. Assinatura binária é sempre a etapa final, a única capaz de \textbf{confirmar} de verdade.
+    \item \textbf{Como se comunica com outras classes:} continua dependendo apenas das três abstrações (\texttt{IConsoleDetector}, \texttt{IContainerDetector}, \texttt{IContainerResolver} -- Inversão de Dependência mantida), e instância internamente um \texttt{BinaryFileReader} sob demanda.
+    \item \textbf{Onde mora:} os mesmos arquivos de sempre -- \texttt{core/include/retroforge/identification/ConsoleIdentifier.hpp} e \texttt{core/src/identification/ConsoleIdentifier.cpp}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/identification/ConsoleIdentifier.hpp
+#pragma once
+
+#include <filesystem>
+#include <memory>
+#include <vector>
+
+#include "retroforge/identification/IConsoleDetector.hpp"
+#include "retroforge/identification/IContainerDetector.hpp"
+#include "retroforge/identification/IContainerResolver.hpp"
+
+namespace retroforge::identification {
+
+class ConsoleIdentifier {
+public:
+    // Aberto para extensao: adicionar um console novo e' registrar um
+    // detector aqui (binario, de conteiner decisivo, OU de conteiner
+    // ambiguo), sem alterar identify().
+    void register_detector(std::unique_ptr<IConsoleDetector> detector);
+    void register_container_detector(std::unique_ptr<IContainerDetector> detector);
+    void register_container_resolver(std::unique_ptr<IContainerResolver> resolver);
+
+    Console identify(const std::filesystem::path& caminho) const;
+
+private:
+    // 64 KB: espaco suficiente para cobrir a area de diretorio de um
+    // ISO9660 tipico, onde SYSTEM.CNF/UMD_DATA.BIN costumam aparecer.
+    static constexpr size_t TAMANHO_CABECALHO = 64 * 1024;
+
+    std::vector<std::unique_ptr<IConsoleDetector>> detectores_binarios_;
+    std::vector<std::unique_ptr<IContainerDetector>> detectores_de_conteiner_;
+    std::vector<std::unique_ptr<IContainerResolver>> resolvedores_de_conteiner_;
+};
+
+} // namespace retroforge::identification
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/identification/ConsoleIdentifier.cpp
+#include "retroforge/identification/ConsoleIdentifier.hpp"
+
+#include "retroforge/io/BinaryFileReader.hpp"
+
+namespace retroforge::identification {
+
+void ConsoleIdentifier::register_detector(std::unique_ptr<IConsoleDetector> detector) {
+    detectores_binarios_.push_back(std::move(detector));
+}
+
+void ConsoleIdentifier::register_container_detector(
+    std::unique_ptr<IContainerDetector> detector) {
+    detectores_de_conteiner_.push_back(std::move(detector));
+}
+
+void ConsoleIdentifier::register_container_resolver(
+    std::unique_ptr<IContainerResolver> resolver) {
+    resolvedores_de_conteiner_.push_back(std::move(resolver));
+}
+
+Console ConsoleIdentifier::identify(const std::filesystem::path& caminho) const {
+    // Fase 1: conteiner DECISIVO -- extensao sozinha basta (.gdi, .cdi).
+    for (const auto& detector : detectores_de_conteiner_) {
+        if (detector->matches(caminho)) {
+            return detector->console();
+        }
+    }
+
+    // Fase 2: conteiner AMBIGUO -- extensao sozinha nao decide nada
+    // (.cue pode ser PS1, Sega CD ou Saturn). Se algum resolver reconhecer
+    // a extensao, passamos a inspecionar o BINARIO REAL por ele apontado
+    // -- nunca o proprio .cue -- na fase seguinte.
+    std::filesystem::path caminho_binario = caminho;
+    for (const auto& resolver : resolvedores_de_conteiner_) {
+        if (auto resolvido = resolver->resolve(caminho)) {
+            caminho_binario = *resolvido;
+            break;
+        }
+    }
+
+    // Fase 3: assinatura binaria, sobre o caminho resolvido (ou sobre o
+    // caminho original, se nenhum resolver da Fase 2 se aplicou -- caso
+    // de um .iso direto de GameCube/PS2/PSP).
+    try {
+        retroforge::io::BinaryFileReader leitor(caminho_binario.string());
+        auto cabecalho = leitor.read_at(0, TAMANHO_CABECALHO);
+
+        for (const auto& detector : detectores_binarios_) {
+            if (detector->matches(cabecalho)) {
+                return detector->console();
+            }
+        }
+    } catch (const std::exception&) {
+        // .cue apontando para um .bin inexistente/ilegivel: nao derruba a
+        // varredura inteira (Modulo 7/9) -- este arquivo especifico cai,
+        // honestamente, em Desconhecido.
+        return Console::Desconhecido;
+    }
+
+    return Console::Desconhecido;
+}
+
+} // namespace retroforge::identification
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+Repare no \texttt{try/catch} envolvendo a abertura do \texttt{BinaryFileReader} na Fase 3 -- isso é novo nesta revisão, e não existia quando \texttt{.cue} era decidido só pela extensão. Agora que um \texttt{.cue} pode apontar para um \texttt{.bin} que não existe (referência quebrada, arquivo movido, dump incompleto), \texttt{identify()} precisa lidar com essa falha sem lançar uma exceção para fora -- uma varredura de HD inteiro (US08) não pode parar por causa de um único \texttt{.cue} problemático. Isso antecipa, em miniatura, exatamente o tipo de resiliência que o Módulo 9 (Tratamento de Erros) vai generalizar para toda a Thread Pool.
+\end{CaixaAlerta}
+
+\subsection{Montando o motor completo: por que isso também é uma classe}
+\label{sec:engine-factory}
+
+Até aqui, cada peça do Motor de Identificação nasceu como uma classe real, com seu contrato, seu lugar na árvore de pastas e sua justificativa SOLID. A \textbf{montagem} de todas essas peças -- decidir quais detectores existem e em que ordem são registrados -- é, ela mesma, uma decisão de regra de negócio: é o que determina, por exemplo, que \texttt{DreamcastGdiDetector} é testado antes de qualquer detector binário, ou que \texttt{CueSheetResolver} precisa estar registrado para que um \texttt{.cue} de PS1 funcione. Deixar essa montagem como uma função solta dentro de um \texttt{main()} de demonstração --- como uma primeira versão deste módulo fazia --- reintroduziria exatamente o problema que a separação Core/Apresentação (Módulo 0) existe para evitar: se essa função vivesse dentro de \texttt{cli/main.cpp}, a futura \texttt{gui/} (Módulo 11) teria que \textbf{duplicá-la} para montar o mesmo motor, e nenhum teste do Módulo 12 poderia validá-la isoladamente sem simular um programa inteiro.
+
+Por isso, a montagem do motor ganha, ela também, uma classe própria.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{IdentificationEngineFactory} existe:} sua única responsabilidade é saber \textit{compor} um \texttt{ConsoleIdentifier} completo -- registrar, na ordem certa (container decisivo $\rightarrow$ container ambíguo $\rightarrow$ assinatura binária, Seção~\ref{sec:tres-formas}), todos os detectores e resolvedores que este módulo definiu. Ela não sabe \textbf{como} nenhum detector reconhece um console -- isso continua sendo, exclusivamente, problema de cada \texttt{IConsoleDetector}/\texttt{IContainerDetector}/\texttt{IContainerResolver} concreto.
+    \item \textbf{Como se comunica com outras classes:} depende de \texttt{ConsoleIdentifier} e de todos os detectores/resolvedores concretos de \texttt{identification::detectors} (ela é, de propósito, a única classe do projeto que precisa conhecer essa lista inteira). É consumida pela camada de apresentação -- \texttt{cli/main.cpp} (Módulo 11) e, futuramente, \texttt{gui/} -- que passam a chamar apenas \texttt{IdentificationEngineFactory::criar()} em vez de repetir a lista de \texttt{register\_detector}/\texttt{register\_container\_detector}/\texttt{register\_container\_resolver} em cada ponto de entrada do programa.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/bootstrap/IdentificationEngineFactory.hpp} e \texttt{core/src/bootstrap/IdentificationEngineFactory.cpp} -- uma pasta nova, \texttt{bootstrap/}, irmã de \texttt{io/}, \texttt{process/}, \texttt{identification/} e \texttt{models/}. Esta pasta é reservada especificamente para classes de \textbf{composição} (que sabem montar um motor inteiro a partir de suas peças), nunca para regra de negócio em si -- e vai crescer módulo a módulo: o Módulo 3 vai introduzir, no mesmo espírito, uma \texttt{CompressionEngineFactory} para o \texttt{CompressionRouter}, sem que esta classe precise ser tocada.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/bootstrap/IdentificationEngineFactory.hpp
+#pragma once
+
+#include "retroforge/identification/ConsoleIdentifier.hpp"
+
+namespace retroforge::bootstrap {
+
+// Responsabilidade unica: saber MONTAR o Motor de Identificacao completo --
+// registrar, na ordem certa, todos os detectores de container decisivo
+// (Fase 1), resolvedores de container ambiguo (Fase 2) e detectores
+// binarios (Fase 3) que o Modulo 2 definiu. NAO decide COMO um console e'
+// identificado -- isso continua sendo responsabilidade exclusiva de cada
+// detector/resolver concreto. Esta classe apenas compoe o grafo de
+// dependencias de UM motor especifico, para que nenhuma camada de
+// apresentacao (cli/, futura gui/) precise conhecer a lista inteira de
+// detectores para poder usar um ConsoleIdentifier pronto.
+class IdentificationEngineFactory {
+public:
+    // Constroi um ConsoleIdentifier pronto para uso, com todos os
+    // detectores/resolvedores registrados na ordem certa (container
+    // decisivo -> container ambiguo -> assinatura binaria, ver Modulo 2).
+    static identification::ConsoleIdentifier criar();
+};
+
+} // namespace retroforge::bootstrap
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/bootstrap/IdentificationEngineFactory.cpp
+#include "retroforge/bootstrap/IdentificationEngineFactory.hpp"
+
+#include "retroforge/identification/detectors/CueSheetResolver.hpp"
+#include "retroforge/identification/detectors/DreamcastCdiDetector.hpp"
+#include "retroforge/identification/detectors/DreamcastGdiDetector.hpp"
+#include "retroforge/identification/detectors/GameCubeDetector.hpp"
+#include "retroforge/identification/detectors/PbpDetector.hpp"
+#include "retroforge/identification/detectors/Ps1Detector.hpp"
+#include "retroforge/identification/detectors/Ps2Detector.hpp"
+#include "retroforge/identification/detectors/PspDetector.hpp"
+#include "retroforge/identification/detectors/SegaCdDetector.hpp"
+#include "retroforge/identification/detectors/SegaSaturnDetector.hpp"
+
+#include <memory>
+
+namespace retroforge::bootstrap {
+
+identification::ConsoleIdentifier IdentificationEngineFactory::criar() {
+    identification::ConsoleIdentifier motor;
+
+    // Fase 1: container DECISIVO -- .gdi/.cdi nunca precisam de confirmacao
+    // por assinatura binaria.
+    motor.register_container_detector(
+        std::make_unique<identification::detectors::DreamcastCdiDetector>());
+    motor.register_container_detector(
+        std::make_unique<identification::detectors::DreamcastGdiDetector>());
+
+    // Fase 2: container AMBIGUO -- .cue resolve para um .bin real, que
+    // depois passa pela Fase 3 normalmente.
+    motor.register_container_resolver(
+        std::make_unique<identification::detectors::CueSheetResolver>());
+
+    // Fase 3: assinatura binaria -- roda sobre .iso diretos ou .bin
+    // resolvidos por um resolver da Fase 2. PbpDetector entra aqui junto
+    // com PspDetector -- ambos disputam a mesma fase, mas nunca colidem
+    // (ver Secao~\ref{sec:pbp-detector}).
+    motor.register_detector(std::make_unique<identification::detectors::GameCubeDetector>());
+    motor.register_detector(std::make_unique<identification::detectors::PbpDetector>());
+    motor.register_detector(std::make_unique<identification::detectors::Ps1Detector>());
+    motor.register_detector(std::make_unique<identification::detectors::Ps2Detector>());
+    motor.register_detector(std::make_unique<identification::detectors::PspDetector>());
+    motor.register_detector(std::make_unique<identification::detectors::SegaCdDetector>());
+    motor.register_detector(std::make_unique<identification::detectors::SegaSaturnDetector>());
+
+    return motor;
+}
+
+} // namespace retroforge::bootstrap
+\end{CaixaCodigo}
+
+Com a fábrica pronta, o ponto de entrada do programa (ainda um \texttt{main()} de demonstração -- o \texttt{main()} definitivo da CLI só nasce no Módulo 11) fica assim:
+
+\begin{CaixaCodigo}
+#include <iostream>
+#include "retroforge/bootstrap/IdentificationEngineFactory.hpp"
+
+using namespace retroforge;
+
+int main() {
+    auto motor = bootstrap::IdentificationEngineFactory::criar();
+
+    auto console = motor.identify("jogo.iso");
+
+    if (console == identification::Console::Desconhecido) {
+        std::cout << "Console nao reconhecido pelos detectores registrados.\n";
+    } else {
+        std::cout << "Console identificado com sucesso.\n";
+    }
+
+    return 0;
+}
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Repare que nenhuma linha registra mais um \texttt{Ps1CueDetector} -- essa classe nunca chegou a ser commitada e não faz parte do design final. PS1 agora é identificado exatamente pelo mesmo mecanismo de assinatura que PS2 e PSP, só que alimentado por um caminho \textbf{resolvido} em vez de um caminho \textbf{direto}. Nenhuma linha dentro de \texttt{ConsoleIdentifier.cpp} ou de \texttt{IdentificationEngineFactory.cpp} soube, de antemão, que \texttt{Ps1Detector} existiria -- toda a extensão aconteceu \textbf{de fora para dentro}, via \texttt{register\_detector}/\texttt{register\_container\_detector}/\texttt{register\_container\_resolver}, exatamente o Princípio Aberto/Fechado prometido no Módulo 0. E, agora, essa composição inteira é testável isoladamente (Módulo 12) sem precisar simular um programa de terminal completo.
+\end{CaixaInfo}
+
+\subsection{Arquitetura de Pastas: o que este módulo acrescenta}
+
+A maior parte deste módulo coube dentro de \texttt{identification/} e sua subpasta \texttt{detectors/}, ao lado da pequena e deliberada edição em \texttt{models/Console.hpp}. Mas a Seção~\ref{sec:engine-factory} introduziu a primeira pasta genuinamente nova deste módulo: \texttt{bootstrap/}, dedicada a classes de \textbf{composição} (que sabem montar um motor inteiro), nunca a regra de negócio em si.
+
+\begin{CaixaArvore}
+core/
+|-- include/retroforge/
+|   |-- models/
+|   |   `-- Console.hpp              [Modulo 0, DreamcastModificado ja
+|   |                                  presente; SegaCD e Saturn NOVOS
+|   |                                  neste modulo -- unica fonte de
+|   |                                  verdade do enum, ver Sec. 3]
+|   |-- identification/
+|   |   |-- IConsoleDetector.hpp     [Modulo 0, sem alteracoes]
+|   |   |-- IContainerDetector.hpp   [Modulo 2, sem alteracoes de logica]
+|   |   |-- IContainerResolver.hpp   [NOVO neste modulo]
+|   |   |-- ConsoleIdentifier.hpp    [REVISADO -- fase 2 nova, resolvedores_]
+|   |   `-- detectors/
+|   |       |-- GameCubeDetector.hpp     [Modulo 0, sem alteracoes]
+|   |       |-- Ps1Detector.hpp          [NOVO -- binario, nao mais container]
+|   |       |-- Ps2Detector.hpp          [Modulo 2, sem alteracoes de assinatura]
+|   |       |-- PspDetector.hpp          [NOVO]
+|   |       |-- PbpDetector.hpp          [NOVO -- Sec.~\ref{sec:pbp-detector}, PSP_PBP]
+|   |       |-- SegaCdDetector.hpp       [NOVO]
+|   |       |-- SegaSaturnDetector.hpp   [NOVO]
+|   |       |-- DreamcastGdiDetector.hpp [Modulo 2, sem alteracoes]
+|   |       |-- DreamcastCdiDetector.hpp [Modulo 2, sem alteracoes]
+|   |       `-- CueSheetResolver.hpp     [NOVO]
+|   `-- bootstrap/                       [NOVO neste modulo]
+|       `-- IdentificationEngineFactory.hpp [NOVO]
+`-- src/
+    |-- identification/
+    |   |-- ConsoleIdentifier.cpp        [REVISADO]
+    |   `-- detectors/
+    |       |-- GameCubeDetector.cpp     [Modulo 0, sem alteracoes]
+    |       |-- Ps1Detector.cpp          [NOVO]
+    |       |-- Ps2Detector.cpp          [REVISADO -- ver CaixaAlerta BOOT2]
+    |       |-- PspDetector.cpp          [NOVO]
+    |       |-- PbpDetector.cpp          [NOVO -- Sec.~\ref{sec:pbp-detector}, PSP_PBP]
+    |       |-- SegaCdDetector.cpp       [NOVO]
+    |       |-- SegaSaturnDetector.cpp   [NOVO]
+    |       |-- DreamcastGdiDetector.cpp [Modulo 2, header-only na pratica]
+    |       |-- DreamcastCdiDetector.cpp [Modulo 2, header-only na pratica]
+    |       `-- CueSheetResolver.cpp     [NOVO]
+    `-- bootstrap/                       [NOVO neste modulo]
+        `-- IdentificationEngineFactory.cpp [NOVO]
+\end{CaixaArvore}
+
+\begin{CaixaInfo}
+\texttt{bootstrap/} é, de propósito, uma pasta de \textbf{composição}, não de regra de negócio -- a mesma distinção que o Módulo 4 vai formalizar entre \texttt{concurrency/} (genérica) e \texttt{batch/} (orquestração específica do domínio). Cada motor do RetroForge (identificação, e futuramente compressão no Módulo 3, e o próprio \texttt{BatchConversionManager} do Módulo 4) ganha sua própria classe de fábrica aqui -- nunca uma fábrica única e genérica que soubesse montar tudo, o que a forçaria a depender de todo o projeto de uma vez, violando a Segregação de Interface no nível de módulo.
+\end{CaixaInfo}
+
+\begin{CaixaInfo}
+Vale registrar explicitamente o que \textbf{não} está mais nesta árvore: uma primeira versão deste módulo teria incluído \texttt{Ps1CueDetector.hpp/.cpp}, decidindo PS1 só pela extensão \texttt{.cue}. Essa classe nunca chegou a ser commitada -- foi descartada ainda em design, ao percebermos a ambiguidade com Sega CD/Saturn (Seção~\ref{sec:tres-formas}). Não há, portanto, nenhuma remoção de código real do repositório: apenas uma decisão de arquitetura tomada antes de qualquer linha ser escrita em definitivo.
+\end{CaixaInfo}
+
+Graças ao \texttt{CONFIGURE\_DEPENDS} configurado no Módulo 1, todos esses arquivos entram no build de \texttt{retroforge\_core} assim que forem salvos em disco -- nenhuma linha do \texttt{core/CMakeLists.txt} precisou ser tocada para este módulo inteiro.
+
+\subsection{Exercícios Práticos do Módulo 2}
+
+\begin{CaixaDesafio}
+Lembrete das etiquetas: \textbf{[projeto]} = vira arquivo/pasta permanente do repositório; \textbf{[laboratório]} = validação prática descartável (não precisa sobreviver no repositório depois de feito).
+
+\begin{enumerate}[label=\textbf{2.\arabic*}]
+    \item \textbf{[projeto]} \texttt{PspDetector} e \texttt{SegaSaturnDetector} já foram implementados e registrados no corpo deste módulo (Seções anteriores) -- se você ainda não os tem no seu clone, este é o momento de commitá-los exatamente como apresentados. \texttt{PbpDetector} (Seção~\ref{sec:pbp-detector}) também é entregável permanente.
+    \item \textbf{[laboratório]} Crie um arquivo \texttt{EBOOT.PBP} fictício (bastam os 4 primeiros bytes corretos: \texttt{0x00 0x50 0x42 0x50}) e outro \texttt{.iso} fictício contendo \texttt{"UMD\_DATA.BIN"}. Rode o motor completo (\texttt{IdentificationEngineFactory::criar()}) sobre os dois e confirme que o primeiro devolve \texttt{Console::PSP\_PBP} e o segundo devolve \texttt{Console::PSP} -- dois valores diferentes, nunca confundidos. Este é um teste manual descartável -- será formalizado como teste automatizado de verdade no Módulo 12.
+    \item \textbf{[laboratório]} Crie um arquivo binário fictício contendo, dentro dos primeiros 64~KB, as strings \texttt{"SYSTEM.CNF"} e \texttt{"BOOT2 = cdrom0:\textbackslash SLUS\_200.01;1"}, e confirme que \texttt{Ps2Detector::matches} retorna \texttt{true} \textbf{e} \texttt{Ps1Detector::matches} retorna \texttt{false} para o mesmo buffer. Repita sem a string \texttt{"BOOT2"} (só \texttt{"SYSTEM.CNF"} e uma linha \texttt{"BOOT = ..."}) e confirme o resultado invertido. É um teste manual descartável -- ele formaliza, na prática, a distinção introduzida pela Seção~\ref{sec:tres-formas} deste módulo.
+    \item \textbf{[projeto]} Implemente \texttt{CueSheetResolver.hpp}/\texttt{.cpp} conforme apresentado. Escreva um \texttt{.cue} de teste com uma linha \texttt{FILE "jogo.bin" BINARY} e um \texttt{jogo.bin} fictício de verdade (contendo \texttt{"SYSTEM.CNF"} e \texttt{"BOOT2"}, por exemplo) na mesma pasta. Monte o motor completo desta seção e confirme que \texttt{identify()} sobre o caminho do \texttt{.cue} devolve \texttt{Console::PS2} -- prova de que a Fase 2 resolveu corretamente para o binário, e a Fase 3 confirmou por assinatura. Note a diferença em relação a uma versão anterior deste exercício: agora o \texttt{.cue} \textbf{precisa} de um \texttt{.bin} com conteúdo real ao lado, porque a extensão sozinha deixou de ser suficiente.
+    \item \textbf{[laboratório]} Repita o exercício anterior, mas aponte o \texttt{.cue} para um \texttt{.bin} que \textbf{não existe} no disco (nome errado, ou arquivo deletado). Confirme que \texttt{identify()} devolve \texttt{Console::Desconhecido} em vez de lançar uma exceção que derrubaria o programa -- é o \texttt{try/catch} da Fase 3 em ação.
+    \item \textbf{[projeto]} Torne \texttt{CueSheetResolver::resolve} insensível a maiúsculas/minúsculas na extensão (um arquivo \texttt{JOGO.CUE} também deveria ser reconhecido) -- a mesma melhoria que uma versão anterior deste módulo já cogitava para o extinto \texttt{Ps1CueDetector}, agora aplicada à classe que de fato existe.
+    \item \textbf{[laboratório]} Discuta por escrito (não precisa codificar): a implementação atual de \texttt{CueSheetResolver} para na \textbf{primeira} linha \texttt{FILE} que encontrar. Isso é suficiente para \textit{cue sheets} multi-trilha (comuns em jogos com faixas de áudio CD-DA, onde a primeira trilha costuma ser a de dados). Mas o que aconteceria se, por algum motivo raro, a primeira linha \texttt{FILE} referenciasse uma trilha de \textbf{áudio} (\texttt{WAVE} em vez de \texttt{BINARY}) ao invés da trilha de dados? Como você adaptaria \texttt{resolve()} para preferir explicitamente uma linha marcada \texttt{BINARY}?
+    \item \textbf{[laboratório]} Escreva um \texttt{main()} que use o motor completo para varrer (com \texttt{std::filesystem::recursive\_directory\_iterator}, adiantando o Módulo 7) uma pasta com arquivos de teste variados -- incluindo pelo menos um \texttt{.cue}/\texttt{.bin} de PS1, um de Sega CD e um de Saturn -- e imprima o console identificado para cada um. Esse \texttt{main()} de demonstração é descartável -- o \texttt{main()} definitivo da CLI só nasce no Módulo 11.
+\end{enumerate}
+\end{CaixaDesafio}
+
+\begin{CaixaResumo}
+Neste módulo você aprendeu:
+\begin{itemize}
+    \item Por que identificação por contêiner tem, na verdade, \textbf{dois} sabores diferentes -- decisivo (\texttt{.gdi}/\texttt{.cdi}, onde a extensão sozinha basta) e ambíguo (\texttt{.cue}, onde a extensão só reduz candidatos e a confirmação real precisa vir de uma assinatura binária) -- e por que forçar os dois dentro da mesma interface (\texttt{IContainerDetector}) esconderia essa diferença de confiabilidade.
+    \item Como \texttt{IContainerResolver} resolve um contêiner ambíguo para um caminho binário real, sem nunca decidir um console sozinho -- mantendo a decisão final onde ela sempre esteve, nos detectores de \texttt{IConsoleDetector}.
+    \item Que PS1 e PS2 compartilham \texttt{SYSTEM.CNF}, e que a diferença real (\texttt{BOOT} vs.\ \texttt{BOOT2}) só se torna um problema prático no momento em que PS1 passa a ser confirmado por assinatura -- e por que corrigir \texttt{Ps2Detector} nesta mesma revisão foi necessário, não opcional.
+    \item Como estender o vocabulário do projeto (\texttt{Console::SegaCD}, \texttt{Console::Saturn}) de forma estritamente aditiva, preenchendo uma lacuna que a documentação v2.0 já previa (Seção 2: ``PS1, PS2, Saturn, Sega CD e Dreamcast $\rightarrow$ chdman'') mas que o Motor de Identificação ainda não cobria.
+    \item Que o mesmo padrão de risco do \texttt{.cdi} de Dreamcast reaparece no PSP -- um contêiner \texttt{EBOOT.PBP} não é um \texttt{.iso} cru -- e por que a resposta correta é, de novo, um valor de enum \textbf{distinto} (\texttt{Console::PSP\_PBP}) e um detector próprio (\texttt{PbpDetector}), nunca um caso especial escondido dentro de \texttt{Console::PSP}.
+    \item Como revisar honestamente uma decisão de design ainda não commitada (o extinto \texttt{Ps1CueDetector}) ao descobrir, durante a implementação, que o problema real era mais sutil do que a primeira solução previa -- sem que isso represente um erro de arquitetura, apenas o processo normal de projetar software incrementalmente.
+    \item Como ordenar as três fases de \texttt{ConsoleIdentifier} (contêiner decisivo $\rightarrow$ contêiner ambíguo $\rightarrow$ assinatura binária) da mais barata para a mais cara, e por que a fase de assinatura precisa, agora, de um \texttt{try/catch} honesto para lidar com referências quebradas dentro de um \texttt{.cue}.
+    \item Por que a \textbf{montagem} de um motor completo (decidir quais detectores existem e em que ordem são registrados) também merece sua própria classe -- \texttt{IdentificationEngineFactory}, em uma pasta nova \texttt{bootstrap/} -- em vez de viver como função solta dentro de um \texttt{main()} de demonstração, evitando duplicação futura entre \texttt{cli/} e \texttt{gui/} e mantendo a composição testável isoladamente (Módulo 12).
+\end{itemize}
+
+Com o console corretamente identificado -- inclusive PS1 e PS2 devidamente desambiguados, Sega CD/Saturn finalmente reconhecidos, e os dois casos de PSP (\texttt{.iso} cru vs.\ \texttt{EBOOT.PBP}) devidamente distinguidos --, o Módulo 3 vai decidir \textbf{o que fazer} com essa informação: o Motor de Recomendação (Smart Context) vai rotear cada \texttt{Console} para a ferramenta de compressão correta, incluindo as rotas novas que este módulo introduziu -- e vai precisar, também, estender a trava explícita de segurança (hoje só aplicada a \texttt{DreamcastModificado}) para cobrir \texttt{PSP\_PBP}.
+\end{CaixaResumo}

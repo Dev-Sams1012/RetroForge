@@ -69,3 +69,14 @@ Testing/
 
 # vscode files
 .vscode/*
+
+# LaTeX auxiliary files
+docs/*.aux
+docs/*.fdb_latexmk
+docs/*.fls
+docs/*.listing
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.synctex*
+docs/*.pdf*

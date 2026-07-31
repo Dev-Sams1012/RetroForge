@@ -1,0 +1,672 @@
+\section{Módulo 4: Assincronismo e Alta Performance (Thread Pool \& Batching)}
+
+O Módulo 3 terminou com uma peça que sabe fazer exatamente uma coisa bem feita: dado um único \texttt{ConversionJob} já identificado, o \texttt{CompressionRouter} decide a ferramenta certa e produz o arquivo comprimido. Mas as \textit{User Stories} da documentação nunca falam de ``um jogo'' -- falam de ``50 jogos'' (US03), de ``um HD inteiro'' (US08), de cancelar \textbf{um} jogo problemático sem derrubar a fila (US05), e de continuar rodando em segundo plano sem travar a máquina do usuário (US04). Chamar \texttt{CompressionRouter::rotear} 50 vezes, sequencialmente, dentro de um \texttt{for}, resolveria a conversão -- mas ignoraria completamente os múltiplos núcleos de qualquer CPU moderna, e não daria ao usuário nenhum controle granular sobre a fila em andamento. Este módulo resolve isso: vamos construir a Thread Pool customizada do RetroForge, o gerenciador de lote que a documentação chama de ``fila inteligente'', e o mecanismo de \textit{Auto-Throttle} que protege a máquina do usuário.
+
+\begin{CaixaInfo}[title={O que já existe vs. o que este módulo constrói}]
+Dos Módulos 0 a 3, já temos prontos: \texttt{models::Console} e \texttt{models::ConversionJob} (cujos campos \texttt{progresso\_} e \texttt{cancelado\_} já são \texttt{std::atomic} desde o Módulo 0 -- uma decisão que só vai mostrar todo o seu valor agora, quando múltiplas threads passarem a interagir com o mesmo \texttt{ConversionJob}), \texttt{ConsoleIdentifier} e \texttt{CompressionRouter}. No repositório público (\texttt{github.com/Dev-Sams1012/RetroForge}), nada mudou desde o retrato feito ao final do Módulo 3: ainda não existe nenhuma pasta de concorrência, nem qualquer gerenciamento de lote. Este módulo cria duas pastas novas -- \texttt{concurrency/} (a \texttt{ThreadPool} genérica, o monitoramento de CPU e o controlador de \textit{throttle}) e \texttt{batch/} (o \texttt{BatchConversionManager}, que amarra a \texttt{ThreadPool} ao \texttt{CompressionRouter} do Módulo 3) -- e deixa \textbf{fora} de escopo, deliberadamente, a varredura recursiva de diretórios: montar a lista real de 50 jogos a partir de uma pasta do HD é responsabilidade do \texttt{std::filesystem::recursive\_directory\_iterator}, que só será formalizado no Módulo 7. Aqui, os jobs chegam prontos (de uma lista, de um teste manual, ou futuramente do CLI) -- o que este módulo resolve é \textbf{como processá-los em paralelo, com segurança}.
+\end{CaixaInfo}
+
+\subsection{O problema com ``um subprocesso por jogo''}
+
+A alternativa mais ingênua para paralelizar a conversão de 50 jogos seria disparar 50 \texttt{std::thread}, cada uma chamando \texttt{CompressionRouter::rotear} para um job diferente, todas ao mesmo tempo. Isso tecnicamente funciona -- e é exatamente o tipo de solução que a documentação rejeita explicitamente (Seção 3.4: ``o usuário pode definir o número de threads simultâneas''). Duas threads por núcleo físico já é sub-ótimo por causa de troca de contexto; 50 threads competindo por 8 núcleos, cada uma abrindo um subprocesso pesado (\texttt{chdman}, \texttt{dolphin-tool}), é uma receita para travar a máquina do usuário -- exatamente o oposto do que a US04 pede.
+
+\begin{itemize}
+    \item \textbf{O que falta:} um número \textbf{fixo e configurável} de trabalhadores (\textit{workers}) processando uma fila, em vez de um número de threads proporcional ao número de jogos. Se o usuário tem 8 núcleos, 8 conversões simultâneas é o ideal -- a 51ª tarefa espera educadamente na fila até que uma das 8 anteriores termine.
+    \item \textbf{O que também falta:} uma forma de cancelar \textbf{um} job específico sem afetar os outros 49 (US05), e uma forma de pausar a fila inteira temporariamente sem perder nenhum trabalho já enfileirado (US04).
+\end{itemize}
+
+Esses três requisitos -- concorrência limitada, cancelamento granular, e capacidade de pausar -- são exatamente o que uma \textit{Thread Pool} clássica resolve, e é isso que construímos a seguir.
+
+\subsection{\texttt{ThreadPool}: a peça de infraestrutura genérica}
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{ThreadPool} existe:} sua única responsabilidade é manter um número fixo de threads trabalhadoras consumindo tarefas de uma fila, de forma segura entre threads (\textit{thread-safe}). Ela \textbf{não sabe nada} sobre consoles, compressão ou \texttt{ConversionJob} -- para ela, uma tarefa é apenas um \texttt{std::function<void()>}. Essa ignorância deliberada é o que a torna reutilizável: se um dia o RetroForge precisar paralelizar outra coisa (por exemplo, o hashing em lote do Scraper, Módulo 5), a mesma classe serve, sem nenhuma alteração.
+    \item \textbf{Como se comunica com outras classes:} não depende de nenhuma classe de domínio do RetroForge -- só da STL (\texttt{<thread>}, \texttt{<mutex>}, \texttt{<condition\_variable>}, \texttt{<queue>}, \texttt{<functional>}). É consumida pelo \texttt{BatchConversionManager} (Seção~\ref{sec:batch-manager}), que é quem sabe traduzir ``comprima este \texttt{ConversionJob}'' em uma tarefa genérica que a \texttt{ThreadPool} entende.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/concurrency/ThreadPool.hpp} e \texttt{core/src/concurrency/ThreadPool.cpp} -- uma pasta nova, \texttt{concurrency/}, irmã de \texttt{io/}, \texttt{process/}, \texttt{identification/}, \texttt{models/} e \texttt{compression/}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/concurrency/ThreadPool.hpp
+#pragma once
+
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
+
+namespace retroforge::concurrency {
+
+// Responsabilidade unica: manter N threads trabalhadoras consumindo
+// tarefas de uma fila compartilhada, de forma segura. NAO sabe nada sobre
+// consoles, compressao ou ConversionJob -- uma tarefa e' so uma funcao.
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t numero_de_threads);
+    ~ThreadPool();
+
+    // Adiciona uma tarefa a fila. Alguma thread trabalhadora ociosa vai
+    // consumi-la assim que possivel (ou assim que a pool for retomada,
+    // se estiver pausada -- ver pausar()/retomar() abaixo).
+    void enfileirar(std::function<void()> tarefa);
+
+    // Auto-Throttle (US04, Secao 4.5): threads trabalhadoras terminam a
+    // tarefa ATUAL, mas nao consomem novas tarefas da fila ate retomar()
+    // ser chamado. Nenhuma tarefa enfileirada e' perdida durante a pausa.
+    void pausar();
+    void retomar();
+
+    // Bloqueia a thread chamadora ate que a fila esteja vazia e nenhuma
+    // tarefa esteja em execucao -- util para "esperar o lote terminar".
+    void aguardar_ociosidade();
+
+private:
+    void loop_trabalhador();
+
+    std::vector<std::thread> trabalhadores_;
+    std::queue<std::function<void()>> fila_de_tarefas_;
+
+    std::mutex mutex_fila_;
+    std::condition_variable condicao_fila_;
+    std::condition_variable condicao_ociosidade_;
+
+    std::atomic<bool> parar_{false};
+    std::atomic<bool> pausado_{false};
+    size_t tarefas_ativas_{0};
+};
+
+} // namespace retroforge::concurrency
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/concurrency/ThreadPool.cpp
+#include "retroforge/concurrency/ThreadPool.hpp"
+
+namespace retroforge::concurrency {
+
+ThreadPool::ThreadPool(size_t numero_de_threads) {
+    trabalhadores_.reserve(numero_de_threads);
+    for (size_t i = 0; i < numero_de_threads; ++i) {
+        trabalhadores_.emplace_back(&ThreadPool::loop_trabalhador, this);
+    }
+}
+
+ThreadPool::~ThreadPool() {
+    {
+        std::lock_guard<std::mutex> trava(mutex_fila_);
+        parar_.store(true);
+    }
+    // notify_all (nao notify_one): TODAS as threads trabalhadoras precisam
+    // acordar para reavaliar o predicado e perceber que devem encerrar.
+    condicao_fila_.notify_all();
+
+    for (auto& trabalhador : trabalhadores_) {
+        if (trabalhador.joinable()) {
+            trabalhador.join();
+        }
+    }
+}
+
+void ThreadPool::enfileirar(std::function<void()> tarefa) {
+    {
+        std::lock_guard<std::mutex> trava(mutex_fila_);
+        fila_de_tarefas_.push(std::move(tarefa));
+    }
+    condicao_fila_.notify_one(); // uma tarefa nova; uma thread ociosa basta
+}
+
+void ThreadPool::pausar() {
+    pausado_.store(true);
+}
+
+void ThreadPool::retomar() {
+    pausado_.store(false);
+    condicao_fila_.notify_all(); // acorda trabalhadores presos aguardando
+}
+
+void ThreadPool::loop_trabalhador() {
+    while (true) {
+        std::function<void()> tarefa;
+
+        {
+            std::unique_lock<std::mutex> trava(mutex_fila_);
+
+            // Acorda quando: (a) o destrutor pediu parada, OU (b) ha uma
+            // tarefa disponivel E a pool nao esta pausada pelo throttle.
+            condicao_fila_.wait(trava, [this] {
+                return parar_.load() || (!pausado_.load() && !fila_de_tarefas_.empty());
+            });
+
+            if (parar_.load() && fila_de_tarefas_.empty()) {
+                return; // encerramento limpo: nada mais a fazer
+            }
+
+            if (pausado_.load()) {
+                continue; // acordou por causa de parar_, mas ainda pausado
+            }
+
+            tarefa = std::move(fila_de_tarefas_.front());
+            fila_de_tarefas_.pop();
+            ++tarefas_ativas_;
+        }
+
+        tarefa(); // executada FORA da secao critica -- nao trava a fila
+
+        {
+            std::lock_guard<std::mutex> trava(mutex_fila_);
+            --tarefas_ativas_;
+            if (fila_de_tarefas_.empty() && tarefas_ativas_ == 0) {
+                condicao_ociosidade_.notify_all();
+            }
+        }
+    }
+}
+
+void ThreadPool::aguardar_ociosidade() {
+    std::unique_lock<std::mutex> trava(mutex_fila_);
+    condicao_ociosidade_.wait(trava, [this] {
+        return fila_de_tarefas_.empty() && tarefas_ativas_ == 0;
+    });
+}
+
+} // namespace retroforge::concurrency
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+Repare que \texttt{tarefa()} é chamada \textbf{fora} da região protegida pelo \texttt{mutex\_fila\_} (o \texttt{std::unique\_lock trava} já saiu de escopo antes dessa linha). Isso é crítico: se a tarefa fosse executada \textit{dentro} da seção crítica, apenas \textbf{uma} conversão poderia rodar por vez -- todas as outras threads ficariam bloqueadas esperando o mutex, e teríamos recriado, com mais complexidade, exatamente o comportamento sequencial que a Thread Pool existe para eliminar.
+\end{CaixaAlerta}
+
+\begin{CaixaInfo}
+Um leitor atento pode notar que \texttt{enfileirar} recebe um \texttt{std::function<void()>} simples -- sem devolver um \texttt{std::future<T>} com o resultado, como bibliotecas de Thread Pool mais sofisticadas costumam oferecer. Essa omissão é deliberada: o \texttt{ConversionJob} (Módulo 0) já expõe \texttt{progresso()} e \texttt{foi\_cancelado()} como campos atômicos, lidos a qualquer momento pela interface (CLI/GUI) sem nenhuma sincronização adicional. Um \texttt{std::future} resolveria um problema que o projeto já resolveu de outra forma -- adicionar um seria complexidade sem benefício real neste contexto.
+\end{CaixaInfo}
+
+\subsection{Cancelamento granular (US05): o que dá para fazer agora, e o que fica para o Módulo 8}
+\label{sec:cancelamento}
+
+A documentação (US05) descreve o cancelamento como enviar um \texttt{SIGTERM} para o subprocesso isolado daquele jogo específico. Antes de prometer isso, vale examinar honestamente o que o projeto já tem disponível: o \texttt{process::ExternalProcessHandle} (Módulo 0) abre o subprocesso via \texttt{popen}, e \texttt{popen} \textbf{não expõe o PID} do processo filho de forma portátil -- só um \texttt{FILE*} para ler a saída. Sem o PID, não há como mandar um \texttt{SIGTERM} cirúrgico para aquele processo específico.
+
+\begin{CaixaAlerta}
+Isto não é um obstáculo que este módulo vai fingir que não existe. \texttt{ChdmanConverter} e \texttt{DolphinToolConverter} (Módulo 3) já foram escritos verificando \texttt{job->foi\_cancelado()} a cada linha lida da saída do subprocesso -- um cancelamento \textbf{cooperativo}: o job para de ler mais saída e retorna \texttt{false} assim que percebe o pedido de cancelamento, mas o processo filho (\texttt{chdman}, por exemplo) continua rodando até terminar sozinho ou até `popen`/`pclose` serem encerrados no destrutor de \texttt{ExternalProcessHandle}. Isso resolve boa parte da US05 na prática -- a fila continua avançando, o job cancelado para de consumir CPU do RetroForge assim que possível -- mas \textbf{não} é um \texttt{SIGTERM} imediato e cirúrgico ao processo externo. Formalizar isso de verdade exige trocar \texttt{popen}/\texttt{pclose} por chamadas de mais baixo nível com rastreamento real de PID (APIs POSIX no Linux, \texttt{CreateProcess} no Windows) -- exatamente o que o Módulo 8 (\textit{O Domador de CLI}) promete fazer. Prometer aqui uma capacidade que a infraestrutura atual não sustenta seria pior do que ser honesto sobre a limitação.
+\end{CaixaAlerta}
+
+Este módulo, então, entrega o cancelamento \textbf{granular} (um job específico, sem afetar os demais) e \textbf{cooperativo} (baseado no \texttt{std::atomic<bool>} que o Módulo 0 já colocou dentro de \texttt{ConversionJob}) -- e documenta claramente, no próprio código, onde termina o que é possível hoje.
+
+\subsection{\texttt{BatchConversionManager}: a fila inteligente (US03/US08)}
+\label{sec:batch-manager}
+
+Com a \texttt{ThreadPool} pronta, falta a classe que sabe traduzir ``processar estes jogos'' em chamadas reais ao \texttt{CompressionRouter} do Módulo 3, mantendo um registro de quais jobs estão em andamento (para permitir cancelamento por caminho, US05).
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{BatchConversionManager} existe:} é a única classe que sabe que ``processar um lote'' significa ``para cada \texttt{ConversionJob}, enfileirar uma tarefa que chama \texttt{CompressionRouter::rotear}''. Nem a \texttt{ThreadPool} (que não sabe o que é um console) nem o \texttt{CompressionRouter} (que não sabe que existe uma fila) têm essa responsabilidade -- ela pertence exclusivamente a esta classe.
+    \item \textbf{Como se comunica com outras classes:} depende de \texttt{compression::CompressionRouter} (por referência -- não é dona dele; o \texttt{CompressionRouter} é montado uma única vez, fora daqui, como já vimos no Módulo 3) e possui, por composição, sua própria \texttt{concurrency::ThreadPool}. É consumida pela camada de apresentação (\texttt{cli/}, e futuramente \texttt{gui/}), que é quem efetivamente chama \texttt{adicionar\_job} para cada arquivo encontrado (Módulo 7) e \texttt{cancelar\_job} quando o usuário pede.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/batch/BatchConversionManager.hpp} e \texttt{core/src/batch/BatchConversionManager.cpp} -- uma segunda pasta nova, \texttt{batch/}, que representa a área de responsabilidade ``orquestração de lote'', distinta tanto de \texttt{concurrency/} (mecanismo genérico) quanto de \texttt{compression/} (regra de roteamento).
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/batch/BatchConversionManager.hpp
+#pragma once
+
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+#include "retroforge/compression/CompressionRouter.hpp"
+#include "retroforge/concurrency/AutoThrottleController.hpp"
+#include "retroforge/concurrency/ICpuMonitor.hpp"
+#include "retroforge/concurrency/ThreadPool.hpp"
+#include "retroforge/models/ConversionJob.hpp"
+
+namespace retroforge::batch {
+
+// Orquestra o processamento em lote (US03/US08): recebe jobs, os enfileira
+// na ThreadPool, e delega a compressao de cada um ao CompressionRouter
+// (Modulo 3) -- sem duplicar nenhuma regra de roteamento aqui.
+class BatchConversionManager {
+public:
+    // 'monitor_cpu' e' opcional (nullptr por padrao = sem Auto-Throttle).
+    // Quando fornecido, o Auto-Throttle (US04, Secao 4.5) e' ligado
+    // automaticamente e desligado no destrutor -- o consumidor externo
+    // nunca precisa gerenciar essa peca manualmente.
+    BatchConversionManager(compression::CompressionRouter& roteador,
+                            size_t numero_de_threads,
+                            std::shared_ptr<concurrency::ICpuMonitor> monitor_cpu = nullptr,
+                            double limiar_throttle_percentual = 95.0);
+
+    void adicionar_job(std::shared_ptr<models::ConversionJob> job);
+
+    // Cancelamento cooperativo (US05) -- ver Secao 4.3 para as limitacoes
+    // desta abordagem em comparacao a um SIGTERM de verdade (Modulo 8).
+    // Retorna false se nenhum job com esse caminho estiver registrado.
+    bool cancelar_job(const std::string& caminho_origem);
+
+    void aguardar_conclusao();
+
+private:
+    compression::CompressionRouter& roteador_;
+    concurrency::ThreadPool pool_;
+    std::unique_ptr<concurrency::AutoThrottleController> throttle_; // nulo = desligado
+
+    std::mutex mutex_jobs_;
+    std::unordered_map<std::string, std::shared_ptr<models::ConversionJob>> jobs_por_caminho_;
+};
+
+} // namespace retroforge::batch
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/batch/BatchConversionManager.cpp
+#include "retroforge/batch/BatchConversionManager.hpp"
+
+namespace retroforge::batch {
+
+BatchConversionManager::BatchConversionManager(
+    compression::CompressionRouter& roteador, size_t numero_de_threads,
+    std::shared_ptr<concurrency::ICpuMonitor> monitor_cpu, double limiar_throttle_percentual)
+    : roteador_(roteador), pool_(numero_de_threads) {
+
+    if (monitor_cpu) {
+        throttle_ = std::make_unique<concurrency::AutoThrottleController>(
+            pool_, std::move(monitor_cpu), limiar_throttle_percentual);
+        throttle_->iniciar();
+    }
+}
+
+void BatchConversionManager::adicionar_job(std::shared_ptr<models::ConversionJob> job) {
+    {
+        std::lock_guard<std::mutex> trava(mutex_jobs_);
+        jobs_por_caminho_[job->caminho_origem()] = job;
+    }
+
+    // Captura por copia do shared_ptr 'job': a lambda (e, por extensao, o
+    // proprio ConversionJob) permanece viva ate a tarefa ser executada,
+    // mesmo que o chamador de adicionar_job() ja tenha descartado sua
+    // propria referencia -- exatamente o cenario de posse compartilhada
+    // que motivou ConversionJob ser shared_ptr desde o Modulo 0.
+    pool_.enfileirar([this, job] {
+        roteador_.rotear(job);
+        // O ResultadoRoteamento (Modulo 3) e' ignorado aqui de proposito:
+        // o Modulo 9 (Tratamento de Erros e Logs Thread-Safe) vai
+        // formalizar COMO esse resultado e' registrado com seguranca a
+        // partir de multiplas threads -- este modulo foca em concorrencia,
+        // nao em observabilidade.
+    });
+}
+
+bool BatchConversionManager::cancelar_job(const std::string& caminho_origem) {
+    std::lock_guard<std::mutex> trava(mutex_jobs_);
+    auto encontrado = jobs_por_caminho_.find(caminho_origem);
+    if (encontrado == jobs_por_caminho_.end()) {
+        return false;
+    }
+    encontrado->second->cancelar(); // std::atomic -- seguro entre threads
+    return true;
+}
+
+void BatchConversionManager::aguardar_conclusao() {
+    pool_.aguardar_ociosidade();
+}
+
+} // namespace retroforge::batch
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+\texttt{BatchConversionManager} guarda \texttt{compression::CompressionRouter\&} por \textbf{referência}, não por valor nem por \texttt{shared\_ptr}. Isso impõe um contrato implícito, mas importante: todas as chamadas a \texttt{register\_strategy} (Módulo 3) devem acontecer \textbf{antes} de qualquer \texttt{adicionar\_job}, e nenhuma nova estratégia deve ser registrada depois que o processamento em lote começar. \texttt{std::unordered\_map::find} (usado dentro de \texttt{rotear}) é seguro para leitura concorrente de múltiplas threads, mas \textbf{não} é seguro se outra thread estiver simultaneamente inserindo uma nova entrada -- exatamente o que \texttt{register\_strategy} faria. Na prática, isso significa: monte o \texttt{CompressionRouter} inteiro primeiro (como no Módulo 3), depois construa o \texttt{BatchConversionManager} -- nunca o contrário.
+\end{CaixaAlerta}
+
+\subsection{Auto-Throttle: \texttt{ICpuMonitor} e o limite de 95\% (US04)}
+
+Falta a última peça: pausar automaticamente a fila quando a CPU do usuário estiver saturada, para que ele continue podendo compilar outros projetos ou usar a máquina normalmente enquanto o RetroForge trabalha em segundo plano.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{ICpuMonitor} existe:} é o contrato mínimo (Segregação de Interface -- um único método) para ``obter o uso percentual de CPU agora''. Ele existe separado de qualquer implementação concreta porque a forma de medir uso de CPU é \textbf{radicalmente diferente} entre sistemas operacionais -- ler \texttt{/proc/stat} só existe no Linux.
+    \item \textbf{Como se comunica com outras classes:} é implementado por \texttt{LinuxProcStatCpuMonitor} (única implementação por enquanto) e consumido exclusivamente por \texttt{AutoThrottleController}, que nunca sabe (nem precisa saber) como o percentual foi calculado -- só que pode perguntar.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/concurrency/ICpuMonitor.hpp}, com implementações concretas em \texttt{core/include/retroforge/concurrency/monitors/} (declaração) e \texttt{core/src/concurrency/monitors/} (implementação) -- a mesma subpasta \texttt{monitors/} espelhando o padrão já estabelecido por \texttt{detectors/} (Módulo 0/2) e \texttt{converters/} (Módulo 3).
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/concurrency/ICpuMonitor.hpp
+#pragma once
+
+namespace retroforge::concurrency {
+
+// Responsabilidade unica: responder "qual e' o uso percentual de CPU
+// agora?" (0.0 a 100.0). Deliberadamente o UNICO metodo desta interface
+// (Segregacao de Interface) -- nenhuma implementacao e' forcada a saber
+// nada alem disso.
+class ICpuMonitor {
+public:
+    virtual ~ICpuMonitor() = default;
+
+    // Uso percentual de CPU medido desde a ULTIMA chamada a este metodo.
+    // A primeira chamada apos a construcao pode devolver 0.0, ja que
+    // ainda nao ha uma amostra anterior para calcular o delta.
+    virtual double uso_percentual() = 0;
+};
+
+} // namespace retroforge::concurrency
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/concurrency/monitors/LinuxProcStatCpuMonitor.hpp
+#pragma once
+
+#include <cstdint>
+
+#include "retroforge/concurrency/ICpuMonitor.hpp"
+
+namespace retroforge::concurrency::monitors {
+
+// Le /proc/stat (especifico do Linux) e calcula o uso percentual de CPU
+// pela diferenca entre duas amostras consecutivas. Uma futura
+// WindowsPdhCpuMonitor (Modulo 13, cross-compilation) implementaria a
+// MESMA interface sem que AutoThrottleController precise mudar uma linha
+// -- Principio Aberto/Fechado aplicado a portabilidade de plataforma.
+class LinuxProcStatCpuMonitor : public ICpuMonitor {
+public:
+    double uso_percentual() override;
+
+private:
+    struct Amostra {
+        uint64_t ocioso = 0;
+        uint64_t total = 0;
+    };
+
+    Amostra ler_amostra_atual() const;
+
+    Amostra amostra_anterior_{};
+    bool tem_amostra_anterior_ = false;
+};
+
+} // namespace retroforge::concurrency::monitors
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/concurrency/monitors/LinuxProcStatCpuMonitor.cpp
+#include "retroforge/concurrency/monitors/LinuxProcStatCpuMonitor.hpp"
+
+#include <fstream>
+#include <string>
+
+namespace retroforge::concurrency::monitors {
+
+LinuxProcStatCpuMonitor::Amostra LinuxProcStatCpuMonitor::ler_amostra_atual() const {
+    std::ifstream arquivo("/proc/stat");
+
+    std::string rotulo;
+    uint64_t usuario = 0, gentil = 0, sistema = 0, ocioso = 0;
+    uint64_t iowait = 0, irq = 0, softirq = 0, roubado = 0;
+
+    // A primeira linha de /proc/stat sempre comeca com "cpu" e resume o
+    // uso agregado de todos os nucleos, na ordem exata destes campos.
+    arquivo >> rotulo >> usuario >> gentil >> sistema >> ocioso >> iowait >> irq >> softirq >>
+        roubado;
+
+    Amostra amostra;
+    amostra.ocioso = ocioso + iowait;
+    amostra.total = usuario + gentil + sistema + ocioso + iowait + irq + softirq + roubado;
+    return amostra;
+}
+
+double LinuxProcStatCpuMonitor::uso_percentual() {
+    Amostra atual = ler_amostra_atual();
+
+    if (!tem_amostra_anterior_) {
+        amostra_anterior_ = atual;
+        tem_amostra_anterior_ = true;
+        return 0.0; // sem base de comparacao na primeira chamada
+    }
+
+    uint64_t delta_total = atual.total - amostra_anterior_.total;
+    uint64_t delta_ocioso = atual.ocioso - amostra_anterior_.ocioso;
+    amostra_anterior_ = atual;
+
+    if (delta_total == 0) {
+        return 0.0; // chamadas consecutivas rapidas demais para medir
+    }
+
+    double fracao_ociosa = static_cast<double>(delta_ocioso) / static_cast<double>(delta_total);
+    return (1.0 - fracao_ociosa) * 100.0;
+}
+
+} // namespace retroforge::concurrency::monitors
+\end{CaixaCodigo}
+
+Com a medição pronta, falta a classe que efetivamente reage a ela, pausando e retomando a \texttt{ThreadPool}:
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{AutoThrottleController} existe:} é a única classe que conhece a \textbf{regra de negócio} do throttle -- ``se o uso de CPU passar de X\%, pause; quando cair de volta, retome''. Nem a \texttt{ThreadPool} (que só sabe pausar/retomar quando mandada) nem o \texttt{ICpuMonitor} (que só sabe medir) têm essa regra.
+    \item \textbf{Como se comunica com outras classes:} guarda uma \textbf{referência} para a \texttt{ThreadPool} que vai controlar (ela não é dona da pool -- quem é dona é o \texttt{BatchConversionManager}) e um \texttt{shared\_ptr<ICpuMonitor>} para a estratégia de medição. Roda em sua própria \texttt{std::thread} de monitoramento, separada das threads trabalhadoras da \texttt{ThreadPool}.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/concurrency/AutoThrottleController.hpp} e \texttt{core/src/concurrency/AutoThrottleController.cpp}, ao lado de \texttt{ThreadPool.hpp} (mesma pasta \texttt{concurrency/}, mas fora de \texttt{monitors/} -- ela orquestra o monitor, não é uma implementação dele).
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/concurrency/AutoThrottleController.hpp
+#pragma once
+
+#include <atomic>
+#include <memory>
+#include <thread>
+
+#include "retroforge/concurrency/ICpuMonitor.hpp"
+#include "retroforge/concurrency/ThreadPool.hpp"
+
+namespace retroforge::concurrency {
+
+// Responsabilidade unica: observar o uso de CPU periodicamente e
+// pausar/retomar uma ThreadPool de acordo com um limiar configuravel
+// (US04). NAO sabe medir CPU sozinha (delega a ICpuMonitor) e NAO sabe
+// executar tarefas (delega a ThreadPool).
+class AutoThrottleController {
+public:
+    AutoThrottleController(ThreadPool& pool, std::shared_ptr<ICpuMonitor> monitor,
+                            double limiar_percentual = 95.0);
+    ~AutoThrottleController();
+
+    void iniciar();
+    void parar();
+
+private:
+    void loop_monitoramento();
+
+    ThreadPool& pool_;
+    std::shared_ptr<ICpuMonitor> monitor_;
+    double limiar_percentual_;
+
+    std::thread thread_monitoramento_;
+    std::atomic<bool> executando_{false};
+};
+
+} // namespace retroforge::concurrency
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/concurrency/AutoThrottleController.cpp
+#include "retroforge/concurrency/AutoThrottleController.hpp"
+
+#include <chrono>
+
+namespace retroforge::concurrency {
+
+using namespace std::chrono_literals;
+
+AutoThrottleController::AutoThrottleController(ThreadPool& pool,
+                                                 std::shared_ptr<ICpuMonitor> monitor,
+                                                 double limiar_percentual)
+    : pool_(pool), monitor_(std::move(monitor)), limiar_percentual_(limiar_percentual) {}
+
+AutoThrottleController::~AutoThrottleController() {
+    parar(); // RAII: garante que a thread de monitoramento sempre encerra
+}
+
+void AutoThrottleController::iniciar() {
+    executando_.store(true);
+    thread_monitoramento_ = std::thread(&AutoThrottleController::loop_monitoramento, this);
+}
+
+void AutoThrottleController::parar() {
+    executando_.store(false);
+    if (thread_monitoramento_.joinable()) {
+        thread_monitoramento_.join();
+    }
+}
+
+void AutoThrottleController::loop_monitoramento() {
+    bool pausado_pelo_throttle = false;
+
+    while (executando_.load()) {
+        double uso = monitor_->uso_percentual();
+
+        if (uso >= limiar_percentual_ && !pausado_pelo_throttle) {
+            pool_.pausar();
+            pausado_pelo_throttle = true;
+        } else if (uso < limiar_percentual_ && pausado_pelo_throttle) {
+            pool_.retomar();
+            pausado_pelo_throttle = false;
+        }
+
+        std::this_thread::sleep_for(500ms); // intervalo de amostragem
+    }
+
+    if (pausado_pelo_throttle) {
+        pool_.retomar(); // nunca deixar a pool travada ao encerrar o monitor
+    }
+}
+
+} // namespace retroforge::concurrency
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+O destrutor de \texttt{AutoThrottleController} chama \texttt{parar()}, que por sua vez garante \texttt{pool\_.retomar()} caso o monitor esteja encerrando \textit{enquanto} a pool está pausada. Sem essa garantia, seria possível destruir o \texttt{AutoThrottleController} (por exemplo, ao encerrar o \texttt{BatchConversionManager}) num momento em que a CPU estava acima do limiar, deixando a \texttt{ThreadPool} \textbf{pausada para sempre} -- um \textit{deadlock} sutil, difícil de reproduzir em teste manual, e exatamente o tipo de bug que RAII (Módulo 0) existe para eliminar por construção.
+\end{CaixaAlerta}
+
+\subsection{Montando o motor completo}
+
+Juntando as três peças deste módulo com o \texttt{CompressionRouter} do Módulo 3:
+
+\begin{CaixaCodigo}
+#include <thread>
+
+#include "retroforge/batch/BatchConversionManager.hpp"
+#include "retroforge/concurrency/monitors/LinuxProcStatCpuMonitor.hpp"
+// ... includes do Modulo 3 (construir_motor_de_recomendacao) omitidos
+
+using namespace retroforge;
+
+int main() {
+    auto roteador = construir_motor_de_recomendacao(); // Modulo 3
+
+    auto monitor_cpu = std::make_shared<concurrency::monitors::LinuxProcStatCpuMonitor>();
+
+    // hardware_concurrency() devolve uma estimativa do numero de nucleos
+    // logicos disponiveis (ex.: 8) -- exatamente o "numero de threads
+    // simultaneas" configuravel que a documentacao (Secao 3.4) descreve.
+    batch::BatchConversionManager gerenciador(
+        roteador, std::thread::hardware_concurrency(), monitor_cpu);
+
+    gerenciador.adicionar_job(std::make_shared<models::ConversionJob>(
+        "/mnt/hd_externo/PS2/Jogo1.iso", models::Console::PS2));
+    gerenciador.adicionar_job(std::make_shared<models::ConversionJob>(
+        "/mnt/hd_externo/GameCube/Jogo2.iso", models::Console::GameCube));
+    // ... mais 48 jobs viriam aqui, tipicamente de uma varredura recursiva
+    // real de diretorio (Modulo 7), nao de chamadas manuais como esta.
+
+    // Usuario percebeu um problema no Jogo2 e cancela so ele (US05):
+    gerenciador.cancelar_job("/mnt/hd_externo/GameCube/Jogo2.iso");
+
+    gerenciador.aguardar_conclusao();
+    return 0;
+}
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Note como \texttt{main()} nunca menciona \texttt{ThreadPool}, \texttt{AutoThrottleController} ou \texttt{ICpuMonitor} diretamente depois de construir o \texttt{monitor\_cpu} -- todos ficam encapsulados dentro do \texttt{BatchConversionManager}. Isso é o Módulo 3 e o Módulo 4 reforçando o mesmo hábito arquitetural: a camada de apresentação (aqui representada por este \texttt{main()} de demonstração) fala com \textbf{uma} classe de alto nível por área de responsabilidade, nunca com a teia inteira de classes internas que a implementam.
+\end{CaixaInfo}
+
+\subsection{Arquitetura de Pastas do Módulo 4}
+
+Duas pastas novas nascem sob \texttt{core/} neste módulo -- a segunda vez que isso acontece no livro (a primeira foi \texttt{compression/}, no Módulo 3):
+
+\begin{CaixaArvore}
+core/
+|-- include/retroforge/
+|   |-- io/                              [Modulo 0, sem alteracoes]
+|   |-- process/                         [Modulo 0, sem alteracoes]
+|   |-- identification/                  [Modulo 0 e 2, sem alteracoes]
+|   |-- models/                          [Modulo 0/2, sem alteracoes]
+|   |-- compression/                     [Modulo 3, sem alteracoes]
+|   |-- concurrency/                     [NOVO neste modulo]
+|   |   |-- ThreadPool.hpp               [NOVO]
+|   |   |-- ICpuMonitor.hpp              [NOVO]
+|   |   |-- AutoThrottleController.hpp   [NOVO]
+|   |   `-- monitors/                    [NOVO -- espelha detectors/, converters/]
+|   |       `-- LinuxProcStatCpuMonitor.hpp [NOVO]
+|   `-- batch/                           [NOVO neste modulo]
+|       `-- BatchConversionManager.hpp   [NOVO]
+`-- src/
+    |-- concurrency/                     [NOVO neste modulo]
+    |   |-- ThreadPool.cpp               [NOVO]
+    |   |-- AutoThrottleController.cpp   [NOVO]
+    |   `-- monitors/
+    |       `-- LinuxProcStatCpuMonitor.cpp [NOVO]
+    `-- batch/                           [NOVO neste modulo]
+        `-- BatchConversionManager.cpp   [NOVO]
+\end{CaixaArvore}
+
+\begin{CaixaInfo}
+Vale notar a diferença de propósito entre as duas pastas novas, porque ela não é óbvia à primeira vista: \texttt{concurrency/} é \textbf{genérica} -- nada ali sabe o que é um \texttt{ConversionJob} ou um \texttt{Console} -- enquanto \texttt{batch/} é \textbf{específica do domínio do RetroForge}, e é a única das duas que depende de \texttt{compression/} e \texttt{models/}. Essa divisão deliberada é o que vai permitir, por exemplo, que o Módulo 5 (hashing em lote do Scraper) reaproveite \texttt{concurrency::ThreadPool} diretamente, sem herdar nenhuma dependência de \texttt{compression/} que não faz sentido para hashing.
+\end{CaixaInfo}
+
+\subsection{Uma linha de CMake pendente: \texttt{Threads::Threads}}
+
+Assim como o Módulo 3 deixou registrado que \texttt{libzip} exigiria uma linha nova em \texttt{core/CMakeLists.txt} (uma decisão de build, não de regra de negócio), este módulo introduz a primeira dependência real de \texttt{std::thread} no projeto -- e, no Linux, isso normalmente exige linkar explicitamente contra a biblioteca de threads do sistema (\texttt{pthread}), algo que o \texttt{CMakeLists.txt} atual (Módulo 1) ainda não faz.
+
+\begin{CaixaAlerta}
+Sem uma linha adicional em \texttt{core/CMakeLists.txt}, o build pode falhar ao linkar (erros de símbolo indefinido relacionados a \texttt{pthread\_create}) em algumas combinações de compilador/sistema, mesmo com todo o código deste módulo correto. A correção, quando o \texttt{CMakeLists.txt} for de fato atualizado (fora do escopo deste módulo, que é sobre regra de negócio de concorrência, não sobre infraestrutura de build), é:
+\begin{CaixaCodigo}
+# Adicao futura ao core/CMakeLists.txt
+
+find_package(Threads REQUIRED)
+
+target_link_libraries(retroforge_core PUBLIC
+    Threads::Threads
+)
+\end{CaixaCodigo}
+\texttt{Threads::Threads} é um alvo especial do CMake que resolve automaticamente a forma correta de linkar threads em cada sistema operacional (\texttt{-pthread} no Linux, nada no Windows/MSVC, onde threads já fazem parte do runtime padrão) -- o mesmo espírito de portabilidade que já motivou \texttt{CMAKE\_CXX\_EXTENSIONS OFF} no Módulo 1.
+\end{CaixaAlerta}
+
+\subsection{Onde o projeto está agora, de fato}
+
+Repetindo o hábito de honestidade dos módulos anteriores: no repositório \texttt{Dev-Sams1012/RetroForge}, nenhuma das pastas \texttt{concurrency/} ou \texttt{batch/} existe ainda, e a linha \texttt{find\_package(Threads REQUIRED)} também não foi commitada em \texttt{core/CMakeLists.txt}. Este módulo entrega mais uma peça do roteiro de implementação incremental do livro; o próximo Pull Request real precisa adicionar as duas pastas novas, suas classes, \textbf{e} a atualização de build necessária para que \texttt{std::thread} linke corretamente em todas as plataformas do CI (Módulo 1).
+
+\subsection{Exercícios Práticos do Módulo 4}
+
+\begin{CaixaDesafio}
+Lembrete das etiquetas: \textbf{[projeto]} = vira arquivo/pasta permanente do repositório; \textbf{[laboratório]} = validação prática descartável (não precisa sobreviver no repositório depois de feito).
+
+\begin{enumerate}[label=\textbf{4.\arabic*}]
+    \item \textbf{[laboratório]} Escreva um \texttt{main()} temporário que crie uma \texttt{ThreadPool} com 2 threads e enfileire 10 tarefas simples (cada uma apenas imprimindo seu próprio número e dormindo 100ms com \texttt{std::this\_thread::sleep\_for}). Confirme, pela ordem e pelo tempo total de execução, que no máximo 2 tarefas rodam simultaneamente, e que \texttt{aguardar\_ociosidade()} só retorna depois que as 10 terminaram. Este \texttt{main()} é descartável -- será formalizado como teste automatizado de verdade no Módulo 12.
+    \item \textbf{[projeto]} Implemente \texttt{PspDetector}... \textit{(nota: caso ainda não tenha feito o Exercício 2.1/3.1 de módulos anteriores, este é um bom momento para revisitá-los antes de prosseguir -- o \texttt{BatchConversionManager} deste módulo já pressupõe um \texttt{CompressionRouter} totalmente montado, incluindo a rota de PSP).}
+    \item \textbf{[projeto]} Implemente \texttt{BatchConversionManager} e \texttt{ThreadPool} exatamente como apresentados nesta seção, e escreva um pequeno programa de demonstração que monte o \texttt{CompressionRouter} completo (Módulo 3), adicione 5 \texttt{ConversionJob} fictícios (apontando para arquivos que nem precisam existir de verdade, já que os conversores vão falhar graciosamente ao tentar abri-los -- Módulo 3, \texttt{try/catch} em \texttt{ChdmanConverter}) e confirme que \texttt{aguardar\_conclusao()} retorna depois que todos os 5 tiverem sido processados (com sucesso ou falha).
+    \item \textbf{[laboratório]} Usando o mesmo programa do exercício anterior, chame \texttt{cancelar\_job} para um dos 5 caminhos \textbf{antes} de chamar \texttt{aguardar\_conclusao()}, e confirme, inspecionando \texttt{job->foi\_cancelado()} depois, que o cancelamento cooperativo funcionou. Depois, discuta por escrito (não precisa codificar): em que cenário exatamente esse cancelamento cooperativo \textbf{não} seria suficiente na prática -- por exemplo, se o \texttt{chdman} estiver processando um arquivo de 4,7 GB e ainda não tiver produzido nenhuma linha de saída para o \texttt{ChdmanConverter} ler?
+    \item \textbf{[laboratório]} Implemente \texttt{LinuxProcStatCpuMonitor} e escreva um pequeno \texttt{main()} que chame \texttt{uso\_percentual()} em um laço, a cada 500ms, durante 10 segundos, imprimindo o valor no terminal. Rode esse programa enquanto compila o próprio RetroForge em outro terminal (\texttt{cmake --build build -j}) e confirme que o percentual sobe visivelmente durante a compilação. O programa de demonstração é descartável.
+    \item \textbf{[projeto]} Implemente \texttt{AutoThrottleController} conforme apresentado, e integre-o a um \texttt{BatchConversionManager} com um \texttt{limiar\_throttle\_percentual} propositalmente baixo (por exemplo, \texttt{5.0}) para forçar a pausa quase imediatamente em qualquer máquina real. Confirme, com prints de depuração temporários dentro de \texttt{loop\_monitoramento} (removidos depois), que a \texttt{ThreadPool} de fato pausa e retoma ao longo da execução, e que nenhuma tarefa enfileirada é perdida quando isso acontece.
+\end{enumerate}
+\end{CaixaDesafio}
+
+\begin{CaixaResumo}
+Neste módulo você aprendeu:
+\begin{itemize}
+    \item Por que uma \texttt{ThreadPool} com número fixo e configurável de trabalhadores é preferível a disparar uma thread por jogo -- e como \texttt{std::mutex} + \texttt{std::condition\_variable} + \texttt{std::atomic} se combinam para implementar uma fila de tarefas segura entre threads, incluindo pausa e retomada sem perda de trabalho.
+    \item Que a decisão do Módulo 0 de tornar \texttt{progresso\_} e \texttt{cancelado\_} campos \texttt{std::atomic} dentro de \texttt{ConversionJob} paga dividendos diretos agora: múltiplas threads trabalhadoras e a thread principal (ou de monitoramento) podem ler e escrever esses campos com segurança, sem nenhum mutex adicional.
+    \item Por que o cancelamento granular deste módulo é honestamente \textbf{cooperativo}, não um \texttt{SIGTERM} cirúrgico ao subprocesso -- e por que essa limitação vem diretamente de uma decisão já tomada no Módulo 0 (\texttt{popen} não expõe PID), a ser resolvida de verdade só no Módulo 8.
+    \item Como separar uma peça de infraestrutura genérica e reutilizável (\texttt{concurrency::ThreadPool}, que não sabe nada sobre consoles) de uma peça de orquestração específica do domínio (\texttt{batch::BatchConversionManager}, que sabe traduzir jobs em tarefas) -- a mesma disciplina de Responsabilidade Única aplicada, desta vez, à concorrência.
+    \item Como \texttt{ICpuMonitor} isola a única parte deste módulo que é inerentemente específica de plataforma (leitura de \texttt{/proc/stat}), preparando o terreno para uma futura implementação Windows sem que \texttt{AutoThrottleController} precise mudar uma linha.
+    \item Por que RAII (o destrutor de \texttt{AutoThrottleController} garantindo \texttt{retomar()} antes de encerrar) evita um \textit{deadlock} sutil -- uma \texttt{ThreadPool} pausada para sempre -- que só apareceria em produção, dificilmente em teste manual.
+    \item Que uma linha de CMake (\texttt{Threads::Threads}) ainda precisa ser adicionada a \texttt{core/CMakeLists.txt} antes que este módulo compile de verdade em todas as plataformas do CI -- e onde exatamente ela deve entrar.
+\end{itemize}
+
+Com jobs sendo processados em paralelo, cancelados individualmente e pausados automaticamente sob carga de CPU, falta responder a uma pergunta que a interface do usuário vai fazer antes mesmo de qualquer conversão começar: ``quantos gigabytes eu vou economizar, e vale a pena buscar o nome oficial deste jogo online?''. O Módulo 5 vai introduzir a Estimativa Preditiva de Armazenamento e o Scraper Online de Metadados -- e, ao fazer isso, vai reaproveitar a \texttt{concurrency::ThreadPool} deste módulo para paralelizar o hashing de múltiplos arquivos ao mesmo tempo, exatamente como a Seção anterior já antecipou.
+\end{CaixaResumo}
