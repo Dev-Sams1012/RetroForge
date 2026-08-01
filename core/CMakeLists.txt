@@ -1,3 +1,14 @@
+if(UNIX AND NOT APPLE)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBZIP REQUIRED IMPORTED_TARGET libzip)
+
+    if(TARGET PkgConfig::LIBZIP AND NOT TARGET libzip::zip)
+        add_library(libzip::zip ALIAS PkgConfig::LIBZIP)
+    endif()
+else()
+    find_package(libzip CONFIG REQUIRED)
+endif()
+
 file(GLOB_RECURSE CORE_SOURCES 
     CONFIGURE_DEPENDS 
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
@@ -26,3 +37,7 @@ target_include_directories(retroforge_core PUBLIC
 )
 
 target_compile_features(retroforge_core PUBLIC cxx_std_20)
+
+target_link_libraries(retroforge_core PRIVATE
+    libzip::zip
+)
