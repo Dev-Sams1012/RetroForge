@@ -8,7 +8,7 @@ namespace retroforge::identification::detectors {
 
 std::optional<std::filesystem::path>
 CueSheetResolver::resolve(const std::filesystem::path &caminho) const {
-    if (caminho.extension() != ".cue") {
+    if (caminho.extension() != ".cue" && caminho.extension() != ".CUE") {
         return std::nullopt;
     };
 

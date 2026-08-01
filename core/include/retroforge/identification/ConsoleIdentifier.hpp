@@ -18,7 +18,7 @@ class ConsoleIdentifier {
     Console identify(const std::filesystem::path &caminho) const;
 
   private:
-    static constexpr size_t TAMANHO_CABECALHO = 64 * 1024;
+    static constexpr size_t TAMANHO_CABECALHO = 4 * 1024 * 1024;
     std::vector<std::unique_ptr<IConsoleDetector>> detectores_binarios_;
     std::vector<std::unique_ptr<IContainerDetector>> detectores_de_conteiner_;
     std::vector<std::unique_ptr<IContainerResolver>> resolvedores_de_conteiner_;
