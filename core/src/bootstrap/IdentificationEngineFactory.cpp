@@ -4,12 +4,14 @@
 #include "retroforge/identification/detectors/DreamcastCdiDetector.hpp"
 #include "retroforge/identification/detectors/DreamcastGdiDetector.hpp"
 #include "retroforge/identification/detectors/GameCubeDetector.hpp"
+#include "retroforge/identification/detectors/GenesisDetector.hpp"
 #include "retroforge/identification/detectors/PbpDetector.hpp"
 #include "retroforge/identification/detectors/Ps1Detector.hpp"
 #include "retroforge/identification/detectors/Ps2Detector.hpp"
 #include "retroforge/identification/detectors/PspDetector.hpp"
 #include "retroforge/identification/detectors/SegaCdDetector.hpp"
 #include "retroforge/identification/detectors/SegaSaturnDetector.hpp"
+#include "retroforge/identification/detectors/SnesDetector.hpp"
 
 #include <memory>
 
@@ -22,11 +24,13 @@ identification::ConsoleIdentifier IdentificationEngineFactory::criar() {
         std::make_unique<identification::detectors::DreamcastCdiDetector>());
     motor.register_container_detector(
         std::make_unique<identification::detectors::DreamcastGdiDetector>());
+    motor.register_container_detector(std::make_unique<identification::detectors::SnesDetector>());
 
     motor.register_container_resolver(
         std::make_unique<identification::detectors::CueSheetResolver>());
 
     motor.register_detector(std::make_unique<identification::detectors::GameCubeDetector>());
+    motor.register_detector(std::make_unique<identification::detectors::GenesisDetector>());
     motor.register_detector(std::make_unique<identification::detectors::PbpDetector>());
     motor.register_detector(std::make_unique<identification::detectors::Ps1Detector>());
     motor.register_detector(std::make_unique<identification::detectors::Ps2Detector>());

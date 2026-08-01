@@ -6,7 +6,7 @@ enum class Console {
     Dreamcast,
     DreamcastModificado,
     GameCube,
-    MegaDrive,
+    Genesis,
     PS1,
     PS2,
     PSP_PBP,
