@@ -22,4 +22,5 @@ class ExternalProcessHandle {
 
     std::unique_ptr<FILE, FechadorDeProcesso> handle_;
 };
+
 } // namespace retroforge::process

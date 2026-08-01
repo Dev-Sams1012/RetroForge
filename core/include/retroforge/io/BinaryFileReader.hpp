@@ -22,4 +22,5 @@ class BinaryFileReader {
     std::ifstream arquivo_;
     std::uintmax_t tamanho_total_;
 };
+
 } // namespace retroforge::io
