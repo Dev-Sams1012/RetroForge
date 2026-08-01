@@ -16,9 +16,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-format pkg-config libzip-dev
+
     - name: Check Code Formatting
       run: |
-        sudo apt-get update && sudo apt-get install -y clang-format
         find core cli -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.h" \) | xargs -r clang-format --dry-run --Werror
         
     - name: Configure CMake

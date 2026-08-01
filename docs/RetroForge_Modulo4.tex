@@ -202,7 +202,7 @@ Com a \texttt{ThreadPool} pronta, falta a classe que sabe traduzir ``processar e
 
 \begin{itemize}
     \item \textbf{Por que \texttt{BatchConversionManager} existe:} é a única classe que sabe que ``processar um lote'' significa ``para cada \texttt{ConversionJob}, enfileirar uma tarefa que chama \texttt{CompressionRouter::rotear}''. Nem a \texttt{ThreadPool} (que não sabe o que é um console) nem o \texttt{CompressionRouter} (que não sabe que existe uma fila) têm essa responsabilidade -- ela pertence exclusivamente a esta classe.
-    \item \textbf{Como se comunica com outras classes:} depende de \texttt{compression::CompressionRouter} (por referência -- não é dona dele; o \texttt{CompressionRouter} é montado uma única vez, fora daqui, como já vimos no Módulo 3, já com sua trava dupla contra \texttt{DreamcastModificado} e \texttt{PSP\_PBP}) e possui, por composição, sua própria \texttt{concurrency::ThreadPool}. É consumida pela camada de apresentação (\texttt{cli/}, e futuramente \texttt{gui/}), que é quem efetivamente chama \texttt{adicionar\_job} para cada arquivo encontrado (Módulo 7) e \texttt{cancelar\_job} quando o usuário pede.
+    \item \textbf{Como se comunica com outras classes:} depende de \texttt{compression::CompressionRouter} (por referência -- não é dona dele; o \texttt{CompressionRouter} é montado uma única vez, fora daqui, via \texttt{bootstrap::CompressionEngineFactory::criar()} (Módulo 3, revisado), já com sua trava dupla contra \texttt{DreamcastModificado} e \texttt{PSP\_PBP} e com as rotas de \texttt{libzip} para \texttt{SNES}/\texttt{Genesis}) e possui, por composição, sua própria \texttt{concurrency::ThreadPool}. É consumida pela camada de apresentação (\texttt{cli/}, e futuramente \texttt{gui/}), que é quem efetivamente chama \texttt{adicionar\_job} para cada arquivo encontrado (Módulo 7) e \texttt{cancelar\_job} quando o usuário pede.
     \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/batch/BatchConversionManager.hpp} e \texttt{core/src/batch/BatchConversionManager.cpp} -- uma segunda pasta nova, \texttt{batch/}, que representa a área de responsabilidade ``orquestração de lote'', distinta tanto de \texttt{concurrency/} (mecanismo genérico) quanto de \texttt{compression/} (regra de roteamento).
 \end{itemize}
 
@@ -557,16 +557,23 @@ Juntando as três peças deste módulo com o \texttt{CompressionRouter} do Módu
 #include <thread>
 
 #include "retroforge/batch/BatchConversionManager.hpp"
+#include "retroforge/bootstrap/CompressionEngineFactory.hpp"
 #include "retroforge/concurrency/monitors/LinuxProcStatCpuMonitor.hpp"
-// ... includes do Modulo 3 (construir_motor_de_recomendacao) omitidos
 
 using namespace retroforge;
 
 int main() {
-    auto roteador = construir_motor_de_recomendacao(); // Modulo 3 -- ja com a
-                                                         // trava dupla contra
-                                                         // DreamcastModificado
-                                                         // e PSP_PBP
+    auto roteador = bootstrap::CompressionEngineFactory::criar(); // Modulo 3
+                                                                   // (revisado) --
+                                                                   // ja com a
+                                                                   // trava dupla
+                                                                   // contra
+                                                                   // DreamcastModificado
+                                                                   // e PSP_PBP,
+                                                                   // e com as
+                                                                   // rotas de
+                                                                   // libzip para
+                                                                   // SNES/Genesis
 
     auto monitor_cpu = std::make_shared<concurrency::monitors::LinuxProcStatCpuMonitor>();
 
