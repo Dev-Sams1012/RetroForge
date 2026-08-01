@@ -1,0 +1,669 @@
+\section{Módulo 5: Pré-Cálculos e Scrapers (Estimativas Inteligentes)}
+
+Os Módulos 2, 3 e 4 já resolvem, em conjunto, três perguntas: \textit{``que console é esse arquivo?''}, \textit{``qual ferramenta comprime isso, ou isso deve ser bloqueado?''} e \textit{``como processar 50 desses ao mesmo tempo, com segurança?''}. Mas antes de o usuário apertar ``Iniciar'' sobre uma pasta de 50 jogos (US03: ``ver uma estimativa de quantos gigabytes irei economizar... antes de apertar `Iniciar'''), a documentação promete duas coisas que nenhuma classe do projeto ainda entrega: um número (\textit{quantos GB isso vai economizar?}) e, sob demanda, um nome oficial (Seção 3.6 da documentação: o Scraper Online de Metadados). Este módulo constrói as duas.
+
+\begin{CaixaInfo}[title={O que já existe vs. o que este módulo constrói}]
+Dos Módulos 0 a 4, já temos prontos: \texttt{models::Console} (vocabulário completo, incluindo os dois sentinelas), \texttt{models::ConversionJob}, \texttt{compression::ICompressionStrategy}/\texttt{CompressionRouter} (cada estratégia já expõe \texttt{extensao\_saida()}, que vamos reaproveitar aqui pela primeira vez fora do Módulo 3), e \texttt{concurrency::ThreadPool} (Módulo 4), que este módulo reaproveita \textbf{sem alterar uma linha} para paralelizar hashing em lote -- exatamente a previsão feita ao final do Módulo 4.
+
+No repositório público (\texttt{github.com/Dev-Sams1012/RetroForge}), nada relacionado a estimativa ou scraping existe ainda: não há pasta \texttt{estimation/} nem \texttt{scraping/} dentro de \texttt{core/include/retroforge/}, nenhuma dependência de \texttt{xxHash} ou \texttt{libcurl} foi adicionada ao \texttt{core/CMakeLists.txt}, e nenhuma chamada de rede foi escrita em lugar nenhum do projeto. Este módulo entrega: (1) o \texttt{StorageEstimator}, que aplica os multiplicadores da Seção 3.3 da documentação sobre o tamanho real do arquivo (via \texttt{std::filesystem::file\_size}, sem abrir o arquivo); (2) a interface \texttt{IHashCalculator} e sua implementação \texttt{XxHashCalculator}, que faz hashing em blocos (retomando a técnica de \textit{chunks} do Módulo 0); (3) o \texttt{MetadataScraperClient}, que consome uma API pública via \texttt{libcurl} apenas quando explicitamente acionado (Seção 3.6: ``Apenas se o usuário clicar em `Renomear / Buscar Metadados'''); e (4) o \texttt{BatchHashScanner}, que reaproveita \texttt{concurrency::ThreadPool} para hashear múltiplos arquivos em paralelo.
+\end{CaixaInfo}
+
+\subsection{Duas responsabilidades, deliberadamente separadas}
+
+É tentador projetar uma única classe ``\texttt{MetadataAndSizeHelper}'' que calcula tamanho \textbf{e} busca metadados online. O Módulo 2 já rejeitou essa tentação uma vez, ao separar \texttt{IContainerDetector} de \texttt{IContainerResolver}; aqui o motivo é o mesmo, só que entre \textbf{estimativa} e \textbf{scraping}:
+
+\begin{itemize}
+    \item \textbf{Estimativa de armazenamento} (Seção 3.3 da documentação) é pura aritmética sobre um número já disponível (\texttt{std::filesystem::file\_size}) e o \texttt{Console} já identificado pelo Módulo 2. Não toca a rede, não lê um único byte do arquivo, e roda \textbf{sempre}, para todo arquivo da fila.
+    \item \textbf{Scraping de metadados} (Seção 3.6) exige ler o arquivo inteiro em blocos para gerar uma hash, e depois consultar uma API externa -- caro, opcional, e só executado \textbf{sob demanda} (``Apenas se o usuário clicar em...'').
+\end{itemize}
+
+\begin{CaixaAlerta}
+Misturar as duas responsabilidades em uma classe faria toda estimativa de tamanho (barata, sempre executada) carregar, sem necessidade, a complexidade e as dependências (\texttt{libcurl}, hashing de arquivo inteiro) de uma operação cara e opcional. US03 (estimativa) e a US derivada de scraping da Seção 3.6 têm ciclos de vida completamente diferentes -- uma acontece \textbf{antes} de qualquer clique do usuário, a outra só \textbf{depois} de um clique explícito. Isso é Responsabilidade Única aplicada não só a uma classe, mas a uma \textbf{área inteira} do projeto: por isso nascem duas pastas novas, \texttt{estimation/} e \texttt{scraping/}, nunca uma pasta única ``\texttt{metadata/}'' genérica.
+\end{CaixaAlerta}
+
+\subsection{Estimativa Preditiva de Armazenamento: \texttt{StorageEstimator}}
+
+A Seção 3.3 da documentação define a regra com precisão: multiplicadores médios por rota de compressão, aplicados sobre o tamanho original do arquivo. Como o \texttt{Console} de um job já foi resolvido pelo Módulo 2, e a rota de compressão (e, portanto, o multiplicador correto) é exatamente a mesma tabela que o \texttt{CompressionRouter} usa para \textbf{rotear} -- só que aqui usada para \textbf{estimar}, não para executar.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{StorageEstimator} existe:} sua única responsabilidade é traduzir ``este arquivo, deste tamanho, deste console'' em ``este tamanho final estimado, em bytes''. Ela não comprime nada, não abre o arquivo, e não sabe nada sobre \texttt{ICompressionStrategy} -- apenas sobre a tabela de multiplicadores da documentação (Seção 3.3: -40\% CD$\to$CHD, -30\% UMD$\to$CSO, e o -30\% de RVZ citado na Seção 3.3 da v2.0).
+    \item \textbf{Como se comunica com outras classes:} recebe apenas um \texttt{models::Console} e um \texttt{std::uintmax\_t} (tamanho original) -- \textbf{nunca} um \texttt{ConversionJob} inteiro nem um \texttt{ICompressionStrategy}. Isso é deliberado: acoplar \texttt{StorageEstimator} a \texttt{ConversionJob} obrigaria toda estimativa em lote (Seção~\ref{sec:batch-estimator}) a construir jobs completos só para perguntar um tamanho -- um acoplamento desnecessário que o Módulo 7 (varredura de diretórios) teria que desfazer mais tarde.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/estimation/StorageEstimator.hpp} e \texttt{core/src/estimation/StorageEstimator.cpp} -- uma pasta nova, \texttt{estimation/}, irmã de \texttt{compression/}, \texttt{concurrency/} e \texttt{batch/}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/estimation/StorageEstimator.hpp
+#pragma once
+
+#include <cstdint>
+
+#include "retroforge/models/Console.hpp"
+
+namespace retroforge::estimation {
+
+// Resultado da estimativa: tamanho estimado apos a compressao, mais o
+// tamanho original (para calcular a economia percentual na interface).
+struct EstimativaArmazenamento {
+    std::uintmax_t tamanho_original = 0;
+    std::uintmax_t tamanho_estimado = 0;
+};
+
+// Responsabilidade unica: aplicar os multiplicadores medios da Secao 3.3
+// da documentacao sobre um tamanho de arquivo ja conhecido. NAO abre o
+// arquivo, NAO sabe comprimir de verdade (isso e' compression::), e NAO
+// sabe identificar o console (isso ja aconteceu no Modulo 2).
+class StorageEstimator {
+public:
+    EstimativaArmazenamento estimar(models::Console console,
+                                     std::uintmax_t tamanho_original) const;
+
+private:
+    // Multiplicador (0.0 a 1.0) representando a FRACAO do tamanho
+    // original que sobrevive apos a compressao. Ex: 0.60 para CHD
+    // (documentacao: "-40% para jogos em CD convertidos para CHD").
+    double multiplicador_para(models::Console console) const;
+};
+
+} // namespace retroforge::estimation
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/estimation/StorageEstimator.cpp
+#include "retroforge/estimation/StorageEstimator.hpp"
+
+namespace retroforge::estimation {
+
+using models::Console;
+
+double StorageEstimator::multiplicador_para(Console console) const {
+    switch (console) {
+        // Discos opticos -> CHD (documentacao Secao 3.3: -40% a -45%
+        // dependendo do console; usamos 0.60 como media conservadora).
+        case Console::PS1:
+        case Console::PS2:
+        case Console::SegaCD:
+        case Console::Saturn:
+        case Console::Dreamcast:
+            return 0.60;
+
+        // GameCube -> RVZ (documentacao v2.0 Secao 3.3: -30%).
+        case Console::GameCube:
+            return 0.70;
+
+        // PSP cru -> CSO (documentacao Secao 3.3: -30% para UMDs).
+        case Console::PSP:
+            return 0.70;
+
+        // Cartuchos ja sao pequenos e pouco compressiveis; .zip
+        // costuma economizar muito pouco -- estimativa conservadora.
+        case Console::SNES:
+        case Console::MegaDrive:
+            return 0.95;
+
+        // Casos bloqueados por seguranca (Modulo 3) ou desconhecidos:
+        // NAO ha compressao real, entao o tamanho estimado e' o mesmo
+        // que o original -- nunca prometemos uma economia que nao
+        // vai acontecer.
+        case Console::DreamcastModificado:
+        case Console::PSP_PBP:
+        case Console::Desconhecido:
+        default:
+            return 1.0;
+    }
+}
+
+EstimativaArmazenamento StorageEstimator::estimar(Console console,
+                                                    std::uintmax_t tamanho_original) const {
+    double fracao = multiplicador_para(console);
+
+    EstimativaArmazenamento resultado;
+    resultado.tamanho_original = tamanho_original;
+    resultado.tamanho_estimado =
+        static_cast<std::uintmax_t>(static_cast<double>(tamanho_original) * fracao);
+
+    return resultado;
+}
+
+} // namespace retroforge::estimation
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+Repare o \texttt{switch} explícito sobre \texttt{Console}, cobrindo \textbf{todos} os valores do enum -- inclusive \texttt{DreamcastModificado} e \texttt{PSP\_PBP}, que devolvem \texttt{1.0} (nenhuma economia prometida) em vez de cair silenciosamente em um \texttt{default} genérico. Isso é o mesmo hábito estabelecido no Módulo 2 (\texttt{-Wswitch} forçando todo \texttt{switch} futuro a tratar cada valor sentinela): se o \texttt{enum class Console} ganhar um console novo em um módulo futuro, o compilador avisa que \texttt{StorageEstimator::multiplicador\_para} também precisa de uma decisão explícita -- nunca herda, por acidente, o comportamento do \texttt{default}.
+\end{CaixaAlerta}
+
+\subsection{Estimativa em lote: reaproveitando \texttt{ThreadPool} sem herdar dependências de compressão}
+\label{sec:batch-estimator}
+
+A US03 fala em ``arrastar uma pasta com 50 jogos'' -- calcular 50 tamanhos de arquivo é uma operação de I/O rápida (apenas metadados do sistema de arquivos, não leitura de conteúdo), mas ainda assim vale paralelizar quando a pasta está em um HD externo lento. Aqui aparece o primeiro pagamento real da separação que o Módulo 4 fez entre \texttt{concurrency/} (genérica) e \texttt{batch/} (específica de domínio): \texttt{concurrency::ThreadPool} pode ser usada por uma classe de estimativa \textbf{sem} que essa classe precise depender de \texttt{compression::CompressionRouter}.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{BatchStorageEstimator} existe:} orquestra \texttt{StorageEstimator} sobre uma lista de caminhos, usando \texttt{concurrency::ThreadPool} para paralelizar as chamadas a \texttt{std::filesystem::file\_size}. Sua responsabilidade termina ao devolver uma lista de \texttt{EstimativaArmazenamento} -- ela não decide rotas de compressão, não converte nada.
+    \item \textbf{Como se comunica com outras classes:} depende de \texttt{estimation::StorageEstimator} (composição direta, sem estado próprio compartilhado) e de \texttt{concurrency::ThreadPool} -- a mesma classe genérica do Módulo 4, sem nenhuma alteração. \textbf{Não} depende de \texttt{compression::CompressionRouter} nem de \texttt{models::ConversionJob} -- a prova concreta de que a divisão \texttt{concurrency/} vs.\ \texttt{compression/} vs.\ \texttt{batch/} do Módulo 4 realmente evitou o acoplamento que pareceria natural.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/estimation/BatchStorageEstimator.hpp} e seu \texttt{.cpp} correspondente, ao lado de \texttt{StorageEstimator.hpp}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/estimation/BatchStorageEstimator.hpp
+#pragma once
+
+#include <filesystem>
+#include <mutex>
+#include <vector>
+
+#include "retroforge/concurrency/ThreadPool.hpp"
+#include "retroforge/estimation/StorageEstimator.hpp"
+#include "retroforge/models/Console.hpp"
+
+namespace retroforge::estimation {
+
+// Um item de entrada: caminho + console ja identificado pelo Modulo 2.
+// Deliberadamente NAO e' um models::ConversionJob -- ver justificativa
+// na Secao 5.4 sobre por que StorageEstimator nao depende de ConversionJob.
+struct ItemParaEstimativa {
+    std::filesystem::path caminho;
+    models::Console console;
+};
+
+// Reaproveita concurrency::ThreadPool (Modulo 4) SEM alterar uma linha
+// dela e SEM depender de compression:: -- a prova de que a separacao
+// entre "mecanismo generico" e "orquestracao de dominio" do Modulo 4
+// permite reuso em um contexto completamente novo (estimativa, nao
+// compressao).
+class BatchStorageEstimator {
+public:
+    explicit BatchStorageEstimator(size_t numero_de_threads);
+
+    std::vector<EstimativaArmazenamento>
+    estimar_lote(const std::vector<ItemParaEstimativa>& itens);
+
+private:
+    concurrency::ThreadPool pool_;
+    StorageEstimator estimador_;
+};
+
+} // namespace retroforge::estimation
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/estimation/BatchStorageEstimator.cpp
+#include "retroforge/estimation/BatchStorageEstimator.hpp"
+
+namespace retroforge::estimation {
+
+BatchStorageEstimator::BatchStorageEstimator(size_t numero_de_threads) : pool_(numero_de_threads) {}
+
+std::vector<EstimativaArmazenamento>
+BatchStorageEstimator::estimar_lote(const std::vector<ItemParaEstimativa>& itens) {
+    std::vector<EstimativaArmazenamento> resultados(itens.size());
+    std::mutex mutex_resultados; // protege apenas contra falso-compartilhamento de escrita
+
+    for (size_t i = 0; i < itens.size(); ++i) {
+        pool_.enfileirar([this, i, &itens, &resultados, &mutex_resultados] {
+            std::error_code erro;
+            auto tamanho = std::filesystem::file_size(itens[i].caminho, erro);
+
+            if (erro) {
+                // Arquivo removido/inacessivel durante a varredura: entrada
+                // honesta com tamanho zero, nunca uma excecao que
+                // derrubaria a estimativa do lote inteiro (mesmo espirito
+                // do try/catch da Fase 3 do ConsoleIdentifier, Modulo 2).
+                std::lock_guard<std::mutex> trava(mutex_resultados);
+                resultados[i] = EstimativaArmazenamento{0, 0};
+                return;
+            }
+
+            auto estimativa = estimador_.estimar(itens[i].console, tamanho);
+
+            std::lock_guard<std::mutex> trava(mutex_resultados);
+            resultados[i] = estimativa;
+        });
+    }
+
+    pool_.aguardar_ociosidade();
+    return resultados;
+}
+
+} // namespace retroforge::estimation
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Cada tarefa escreve em um índice \textbf{distinto} de \texttt{resultados} (\texttt{resultados[i]}), então o \texttt{mutex\_resultados} aqui não protege contra uma verdadeira condição de corrida de dados -- protege contra o caso mais sutil de \textit{false sharing} e generaliza o padrão para qualquer estrutura de resultado futura que não seja tão trivialmente particionável quanto um \texttt{std::vector} pré-dimensionado. Um leitor atento notará que, tecnicamente, escrever em índices diferentes de um \texttt{std::vector} já pré-dimensionado é seguro sem mutex algum -- mantemos a trava aqui por disciplina defensiva e para deixar o padrão pronto para reutilização em cenários menos triviais (Exercício 5.6 discute isso).
+\end{CaixaInfo}
+
+\subsection{Hashing eficiente: \texttt{IHashCalculator} e \texttt{XxHashCalculator}}
+
+O Scraper (Seção 3.6) só existe se o usuário pedir. Mas quando pedir, precisa de uma hash do arquivo \textbf{inteiro} -- e o Módulo 0 já deixou pronta a técnica certa para isso (leitura em \textit{chunks} de 4 MB, Seção de manipulação binária). Falta encapsular essa técnica atrás de uma abstração, para que o algoritmo de hash em si (\texttt{xxHash} hoje, talvez outro no futuro) não vaze para quem consome o resultado.
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{IHashCalculator} existe:} contrato mínimo (Segregação de Interface) para ``calcular uma hash de um arquivo inteiro, em blocos''. Existe separada de qualquer implementação concreta porque o algoritmo de hash é um detalhe de mecanismo -- exatamente o mesmo raciocínio que levou o Módulo 3 a unificar \texttt{ICompressionStrategy} para subprocesso \textbf{e} biblioteca estática.
+    \item \textbf{Como se comunica com outras classes:} implementada por \texttt{XxHashCalculator} (usa a biblioteca \texttt{xxHash}, prevista desde o Módulo 1 como candidata a \texttt{FetchContent}); consumida por \texttt{MetadataScraperClient} e por \texttt{BatchHashScanner} (Seção~\ref{sec:batch-hash}).
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/scraping/IHashCalculator.hpp} -- uma segunda pasta nova, \texttt{scraping/}, irmã de \texttt{estimation/}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/scraping/IHashCalculator.hpp
+#pragma once
+
+#include <cstdint>
+#include <filesystem>
+#include <string>
+
+namespace retroforge::scraping {
+
+// Responsabilidade unica: calcular uma hash de um arquivo inteiro, lendo-o
+// em blocos (retomando a tecnica de chunks do Modulo 0) em vez de carregar
+// o arquivo inteiro na RAM. NAO decide o que fazer com a hash depois --
+// isso e' responsabilidade de MetadataScraperClient.
+class IHashCalculator {
+public:
+    virtual ~IHashCalculator() = default;
+
+    // Retorna a hash como string hexadecimal. Lanca std::runtime_error
+    // se o arquivo nao puder ser aberto.
+    virtual std::string calcular(const std::filesystem::path& caminho) const = 0;
+};
+
+} // namespace retroforge::scraping
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/scraping/XxHashCalculator.hpp
+#pragma once
+
+#include "retroforge/scraping/IHashCalculator.hpp"
+
+namespace retroforge::scraping {
+
+// Implementacao concreta usando a biblioteca xxHash (extrema velocidade
+// de leitura de chunks, ver documentacao Secao 2). Le o arquivo em blocos
+// de 4 MB -- o MESMO tamanho de chunk usado na demonstracao do Modulo 0 --
+// para nunca alocar um buffer do tamanho do arquivo inteiro.
+class XxHashCalculator : public IHashCalculator {
+public:
+    std::string calcular(const std::filesystem::path& caminho) const override;
+
+private:
+    static constexpr size_t TAMANHO_CHUNK = 4 * 1024 * 1024; // 4 MB
+};
+
+} // namespace retroforge::scraping
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/scraping/XxHashCalculator.cpp
+#include "retroforge/scraping/XxHashCalculator.hpp"
+
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
+
+#include <xxhash.h> // API C da biblioteca xxHash
+
+namespace retroforge::scraping {
+
+std::string XxHashCalculator::calcular(const std::filesystem::path& caminho) const {
+    std::ifstream arquivo(caminho, std::ios::in | std::ios::binary);
+    if (!arquivo.is_open()) {
+        throw std::runtime_error("Nao foi possivel abrir para hashing: " + caminho.string());
+    }
+
+    // XXH64_createState/freeState seguem o mesmo espirito RAII que
+    // ExternalProcessHandle (Modulo 0) -- aqui usamos um estado de pilha
+    // simples porque a API xxHash ja oferece reset() sem alocacao extra.
+    XXH64_state_t estado;
+    XXH64_reset(&estado, 0);
+
+    std::vector<char> buffer(TAMANHO_CHUNK);
+
+    while (arquivo) {
+        arquivo.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        std::streamsize lidos = arquivo.gcount();
+
+        if (lidos <= 0) {
+            break;
+        }
+
+        XXH64_update(&estado, buffer.data(), static_cast<size_t>(lidos));
+    }
+
+    XXH64_hash_t resultado = XXH64_digest(&estado);
+
+    std::ostringstream saida;
+    saida << std::hex << std::setw(16) << std::setfill('0') << resultado;
+    return saida.str();
+}
+
+} // namespace retroforge::scraping
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+Note que \texttt{XxHashCalculator} nunca lê o arquivo inteiro para a memória de uma vez -- exatamente a mesma disciplina do Módulo 0 (\texttt{processar\_arquivo\_em\_chunks}), agora aplicada dentro de uma classe de verdade em vez de uma função livre de demonstração. Isso importa ainda mais aqui do que na identificação (Módulo 2): a identificação lê só os primeiros 64 KB, mas o hashing do Scraper precisa, por definição, ler o arquivo \textbf{inteiro} -- um jogo de PS2 de 4,7 GB sem essa disciplina de \textit{chunks} derrubaria a máquina por falta de memória, especialmente se vários hashes rodarem em paralelo (Seção~\ref{sec:batch-hash}).
+\end{CaixaAlerta}
+
+\subsection{O cliente do Scraper: \texttt{MetadataScraperClient}}
+
+Com a hash calculada, falta consumir a API pública (Seção 3.6: ``ex: RetroAchievements'') e decidir o que fazer com a resposta -- renomear se o hash for reconhecido, ou avisar e manter o nome original se for um hack/tradução (US02).
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{MetadataScraperClient} existe:} orquestra o fluxo completo do Scraper -- calcular a hash (via \texttt{IHashCalculator}, Inversão de Dependência), enviá-la à API, e traduzir a resposta JSON em um resultado tipado que a camada de apresentação (\texttt{cli/}, Módulo 11) pode exibir. Não sabe nada sobre identificação de console nem sobre compressão -- é, de propósito, tão isolado do resto do \texttt{core} quanto \texttt{CompressionRouter} é isolado de \texttt{ConsoleIdentifier} (Módulo 3).
+    \item \textbf{Como se comunica com outras classes:} depende de \texttt{IHashCalculator} (abstração) e de \texttt{libcurl} internamente (a única classe do projeto, até aqui, que fala com a rede). É consumida exclusivamente pela camada de apresentação, e apenas quando o usuário aciona explicitamente ``Renomear / Buscar Metadados'' (Seção 3.6) -- nunca automaticamente durante uma varredura ou conversão.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/scraping/MetadataScraperClient.hpp} e seu \texttt{.cpp} correspondente, ao lado de \texttt{IHashCalculator.hpp}.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/scraping/MetadataScraperClient.hpp
+#pragma once
+
+#include <memory>
+#include <optional>
+#include <string>
+
+#include "retroforge/scraping/IHashCalculator.hpp"
+
+namespace retroforge::scraping {
+
+// Resultado do scraping: distingue "hash reconhecida" de "hash
+// desconhecida" -- a mesma disciplina de resultados tipados que o
+// Modulo 3 usou com ResultadoRoteamento, em vez de sobrecarregar um
+// simples bool ou uma string vazia com multiplos significados.
+struct ResultadoScraping {
+    bool hash_reconhecida = false;
+    std::optional<std::string> nome_oficial; // ex: "God of War - Ghost of Sparta (USA)"
+};
+
+// Orquestra: calcular hash -> consultar API publica -> traduzir resposta.
+// So' e' acionada sob demanda (Secao 3.6: "Apenas se o usuario clicar em
+// Renomear / Buscar Metadados") -- NUNCA automaticamente durante uma
+// varredura ou conversao em lote (Modulo 4).
+class MetadataScraperClient {
+public:
+    explicit MetadataScraperClient(std::unique_ptr<IHashCalculator> calculadora_de_hash);
+
+    // Retorna nullopt se a requisicao de rede falhar (sem internet,
+    // API fora do ar) -- distinto de "hash desconhecida", que e' uma
+    // resposta valida da API dizendo "nunca vi este arquivo".
+    std::optional<ResultadoScraping> buscar_metadados(const std::filesystem::path& caminho);
+
+private:
+    std::unique_ptr<IHashCalculator> calculadora_de_hash_;
+};
+
+} // namespace retroforge::scraping
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/scraping/MetadataScraperClient.cpp
+#include "retroforge/scraping/MetadataScraperClient.hpp"
+
+#include <curl/curl.h>
+
+#include <iostream>
+
+namespace retroforge::scraping {
+
+namespace {
+
+// Callback de escrita exigido pela API C do libcurl -- acumula o corpo
+// da resposta HTTP em uma std::string, no mesmo espirito de RAII que
+// ExternalProcessHandle (Modulo 0) aplica a popen/pclose: o handle CURL*
+// e' fechado via curl_easy_cleanup logo abaixo, sempre, mesmo em erro.
+size_t escrever_resposta(void* dados, size_t tamanho, size_t nmemb, void* buffer_saida) {
+    size_t total = tamanho * nmemb;
+    static_cast<std::string*>(buffer_saida)->append(static_cast<char*>(dados), total);
+    return total;
+}
+
+} // namespace
+
+MetadataScraperClient::MetadataScraperClient(std::unique_ptr<IHashCalculator> calculadora_de_hash)
+    : calculadora_de_hash_(std::move(calculadora_de_hash)) {}
+
+std::optional<ResultadoScraping>
+MetadataScraperClient::buscar_metadados(const std::filesystem::path& caminho) {
+    std::string hash;
+    try {
+        hash = calculadora_de_hash_->calcular(caminho);
+    } catch (const std::exception& erro) {
+        std::cerr << "Falha ao calcular hash para scraping: " << erro.what() << "\n";
+        return std::nullopt;
+    }
+
+    CURL* handle = curl_easy_init();
+    if (!handle) {
+        return std::nullopt;
+    }
+
+    std::string url = "https://api.retroachievements.exemplo/hash/" + hash;
+    std::string corpo_resposta;
+
+    curl_easy_setopt(handle, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, escrever_resposta);
+    curl_easy_setopt(handle, CURLOPT_WRITEDATA, &corpo_resposta);
+    curl_easy_setopt(handle, CURLOPT_TIMEOUT, 10L);
+
+    CURLcode codigo = curl_easy_perform(handle);
+    curl_easy_cleanup(handle); // RAII manual -- sempre chamado, sucesso ou falha
+
+    if (codigo != CURLE_OK) {
+        return std::nullopt; // sem internet, API fora do ar, timeout, etc.
+    }
+
+    // NOTA: parsing real de JSON (extrair "nome_padronizado" do corpo)
+    // e' deixado como Exercicio 5.3 -- o foco deste modulo e' a
+    // arquitetura do fluxo hash -> rede -> resultado tipado, nao a
+    // escolha de uma biblioteca JSON especifica.
+    ResultadoScraping resultado;
+    resultado.hash_reconhecida = !corpo_resposta.empty();
+    if (resultado.hash_reconhecida) {
+        resultado.nome_oficial = corpo_resposta; // placeholder ate o parsing real
+    }
+
+    return resultado;
+}
+
+} // namespace retroforge::scraping
+\end{CaixaCodigo}
+
+\begin{CaixaInfo}
+Repare a distinção de três níveis em \texttt{std::optional<ResultadoScraping>}: (1) \texttt{std::nullopt} -- falha de \textbf{rede} (sem internet, API fora do ar); (2) \texttt{ResultadoScraping\{false, nullopt\}} -- a API respondeu, mas \textbf{não reconhece} esta hash (romhack ou tradução, US02: ``o app avisa que a hash é desconhecida e mantém o nome original''); (3) \texttt{ResultadoScraping\{true, "God of War..."\}} -- \textit{clean dump} reconhecido. Três situações semanticamente diferentes, assim como o Módulo 3 distinguiu \texttt{ConversaoIniciada}/\texttt{BloqueadoPorSeguranca}/\texttt{ConsoleNaoSuportado} em vez de um simples \texttt{bool}.
+\end{CaixaInfo}
+
+\begin{CaixaAlerta}
+\texttt{\#include <curl/curl.h>} e \texttt{\#include <xxhash.h>} só compilam se essas bibliotecas estiverem disponíveis para o compilador -- decisão de \textbf{build} ainda pendente, no mesmo espírito do \texttt{libzip} do Módulo 3. O Módulo 1 já havia reservado o terreno: \texttt{xxHash} via \texttt{FetchContent} (biblioteca pequena, com um arquivo \texttt{.c} de implementação) e \texttt{libcurl} via \texttt{find\_package(CURL REQUIRED)} (biblioteca grande, com dependências do próprio sistema operacional). Formalizar essas duas linhas em \texttt{core/CMakeLists.txt} é trabalho de infraestrutura de build, fora do escopo deste módulo -- mas o código acima já pressupõe que elas vão existir antes de o projeto compilar de verdade.
+\end{CaixaAlerta}
+
+\subsection{Hashing em lote: reaproveitando \texttt{ThreadPool} de novo}
+\label{sec:batch-hash}
+
+A Seção 3.6 da documentação também prevê, implicitamente, que um usuário pode querer buscar metadados para \textbf{vários} arquivos de uma vez (a mesma pasta de 50 jogos da US03). Assim como \texttt{BatchStorageEstimator} (Seção~\ref{sec:batch-estimator}) reaproveitou \texttt{concurrency::ThreadPool} para paralelizar cálculos de tamanho, \texttt{BatchHashScanner} reaproveita a mesma classe para paralelizar hashing -- exatamente a previsão feita ao final do Módulo 4 (``o Módulo 5 vai... reaproveitar a \texttt{concurrency::ThreadPool} deste módulo para paralelizar o hashing de múltiplos arquivos ao mesmo tempo'').
+
+\begin{itemize}
+    \item \textbf{Por que \texttt{BatchHashScanner} existe:} aplica \texttt{IHashCalculator} sobre uma lista de caminhos, em paralelo, devolvendo um mapa de caminho para hash. Não decide o que fazer com as hashes -- isso é papel de quem chama, tipicamente alimentando \texttt{MetadataScraperClient} um a um, ou uma futura otimização (Exercício 5.5) que envia lotes de hashes numa única requisição de rede.
+    \item \textbf{Como se comunica com outras classes:} depende de \texttt{scraping::IHashCalculator} (abstração -- nunca \texttt{XxHashCalculator} diretamente) e de \texttt{concurrency::ThreadPool}, a \textbf{terceira} classe consecutiva neste módulo a reaproveitar a Thread Pool do Módulo 4 sem alterá-la.
+    \item \textbf{Onde ela mora:} \texttt{core/include/retroforge/scraping/BatchHashScanner.hpp} e seu \texttt{.cpp} correspondente.
+\end{itemize}
+
+\begin{CaixaCodigo}
+// Arquivo: core/include/retroforge/scraping/BatchHashScanner.hpp
+#pragma once
+
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "retroforge/concurrency/ThreadPool.hpp"
+#include "retroforge/scraping/IHashCalculator.hpp"
+
+namespace retroforge::scraping {
+
+class BatchHashScanner {
+public:
+    BatchHashScanner(std::unique_ptr<IHashCalculator> calculadora_de_hash,
+                      size_t numero_de_threads);
+
+    // Hasheia todos os caminhos em paralelo. Arquivos que falharem ao
+    // abrir simplesmente NAO aparecem no mapa de resultado -- ausencia
+    // de chave, nao uma string vazia, sinaliza falha (o mesmo padrao de
+    // "ausencia como sinal" usado pelo unordered_map de estrategias do
+    // CompressionRouter, Modulo 3).
+    std::unordered_map<std::string, std::string>
+    hashear_lote(const std::vector<std::filesystem::path>& caminhos);
+
+private:
+    std::unique_ptr<IHashCalculator> calculadora_de_hash_;
+    concurrency::ThreadPool pool_;
+};
+
+} // namespace retroforge::scraping
+\end{CaixaCodigo}
+
+\begin{CaixaCodigo}
+// Arquivo: core/src/scraping/BatchHashScanner.cpp
+#include "retroforge/scraping/BatchHashScanner.hpp"
+
+#include <iostream>
+
+namespace retroforge::scraping {
+
+BatchHashScanner::BatchHashScanner(std::unique_ptr<IHashCalculator> calculadora_de_hash,
+                                   size_t numero_de_threads)
+    : calculadora_de_hash_(std::move(calculadora_de_hash)), pool_(numero_de_threads) {}
+
+std::unordered_map<std::string, std::string>
+BatchHashScanner::hashear_lote(const std::vector<std::filesystem::path>& caminhos) {
+    std::unordered_map<std::string, std::string> resultados;
+    std::mutex mutex_resultados; // aqui SIM protege contra corrida real --
+                                 // multiplas threads inserindo na MESMA
+                                 // unordered_map, diferente do vector
+                                 // pre-dimensionado de BatchStorageEstimator.
+
+    for (const auto& caminho : caminhos) {
+        pool_.enfileirar([this, caminho, &resultados, &mutex_resultados] {
+            try {
+                std::string hash = calculadora_de_hash_->calcular(caminho);
+
+                std::lock_guard<std::mutex> trava(mutex_resultados);
+                resultados[caminho.string()] = hash;
+            } catch (const std::exception& erro) {
+                std::cerr << "Falha ao hashear " << caminho << ": " << erro.what() << "\n";
+                // Arquivo simplesmente ausente do mapa -- fila continua
+                // (mesmo espirito do try/catch em ChdmanConverter, Modulo 3).
+            }
+        });
+    }
+
+    pool_.aguardar_ociosidade();
+    return resultados;
+}
+
+} // namespace retroforge::scraping
+\end{CaixaCodigo}
+
+\begin{CaixaAlerta}
+Diferente de \texttt{BatchStorageEstimator} (onde o \texttt{mutex} era defensivo, sobre índices já disjuntos de um \texttt{vector}), aqui o \texttt{mutex\_resultados} é \textbf{estritamente necessário}: várias threads chamando \texttt{resultados[chave] = valor]} simultaneamente sobre o \textbf{mesmo} \texttt{std::unordered\_map} é uma condição de corrida de dados real -- \texttt{operator[]} pode disparar um \textit{rehash} interno da tabela, invalidando iteradores e ponteiros de outras threads no meio de uma escrita concorrente. Vale comparar as duas classes lado a lado (Exercício 5.6): a mesma \texttt{ThreadPool}, dois padrões de sincronização genuinamente diferentes, dependendo da estrutura de dados de destino.
+\end{CaixaAlerta}
+
+\subsection{Arquitetura de Pastas do Módulo 5}
+
+Duas pastas novas nascem sob \texttt{core/} neste módulo -- a terceira e quarta vez que isso acontece no livro (\texttt{compression/} no Módulo 3, \texttt{concurrency/}/\texttt{batch/} no Módulo 4):
+
+\begin{CaixaArvore}
+core/
+|-- include/retroforge/
+|   |-- io/                              [Modulo 0, sem alteracoes]
+|   |-- process/                         [Modulo 0, sem alteracoes]
+|   |-- identification/                  [Modulo 0 e 2, sem alteracoes]
+|   |-- bootstrap/                       [Modulo 2, sem alteracoes]
+|   |-- models/                          [Modulo 0/2, sem alteracoes]
+|   |-- compression/                     [Modulo 3, sem alteracoes]
+|   |-- concurrency/                     [Modulo 4, sem alteracoes --
+|   |                                      ThreadPool reaproveitada 3x aqui]
+|   |-- batch/                           [Modulo 4, sem alteracoes]
+|   |-- estimation/                      [NOVO neste modulo]
+|   |   |-- StorageEstimator.hpp         [NOVO]
+|   |   `-- BatchStorageEstimator.hpp    [NOVO]
+|   `-- scraping/                        [NOVO neste modulo]
+|       |-- IHashCalculator.hpp          [NOVO]
+|       |-- XxHashCalculator.hpp         [NOVO]
+|       |-- MetadataScraperClient.hpp    [NOVO]
+|       `-- BatchHashScanner.hpp         [NOVO]
+`-- src/
+    |-- estimation/                      [NOVO neste modulo]
+    |   |-- StorageEstimator.cpp         [NOVO]
+    |   `-- BatchStorageEstimator.cpp    [NOVO]
+    `-- scraping/                        [NOVO neste modulo]
+        |-- XxHashCalculator.cpp         [NOVO]
+        |-- MetadataScraperClient.cpp    [NOVO]
+        `-- BatchHashScanner.cpp         [NOVO]
+\end{CaixaArvore}
+
+\begin{CaixaInfo}
+Vale notar por que \texttt{estimation/} e \texttt{scraping/} são pastas separadas, e não uma única \texttt{metadata/}: nenhuma classe de \texttt{estimation/} depende de \texttt{scraping/}, nem o contrário -- \texttt{StorageEstimator} nunca precisa de uma hash, e \texttt{MetadataScraperClient} nunca precisa de um multiplicador de compressão. A única coisa que as duas pastas compartilham é o \textbf{reaproveitamento} de \texttt{concurrency::ThreadPool}, e isso já é possível porque a Thread Pool vive em sua própria pasta genérica, sem pertencer a nenhuma das duas.
+\end{CaixaInfo}
+
+\subsection{Duas linhas de CMake pendentes: \texttt{xxHash} e \texttt{libcurl}}
+
+Seguindo o mesmo hábito de honestidade dos Módulos 3 e 4 (que deixaram registradas as pendências de \texttt{libzip} e \texttt{Threads::Threads}), este módulo introduz duas dependências externas novas que ainda não foram formalizadas em \texttt{core/CMakeLists.txt}.
+
+\begin{CaixaAlerta}
+Sem essas duas adições, nenhum arquivo de \texttt{scraping/} compila. A correção, quando \texttt{core/CMakeLists.txt} for de fato atualizado (fora do escopo deste módulo):
+\begin{CaixaCodigo}
+# Adicao futura ao core/CMakeLists.txt
+
+include(FetchContent)
+FetchContent_Declare(
+    xxhash
+    GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
+    GIT_TAG v0.8.2
+    SOURCE_SUBDIR cmake_unofficial
+)
+FetchContent_MakeAvailable(xxhash)
+
+find_package(CURL REQUIRED)
+
+target_link_libraries(retroforge_core PUBLIC
+    xxhash
+    CURL::libcurl
+)
+\end{CaixaCodigo}
+\texttt{xxHash} segue a estratégia \texttt{FetchContent} já anunciada no Módulo 1 (biblioteca pequena, compilada junto); \texttt{libcurl} segue \texttt{find\_package}, exatamente como o Módulo 1 previu (biblioteca grande, com dependências do próprio sistema operacional, localizada no ambiente do usuário ou do runner de CI).
+\end{CaixaAlerta}
+
+\subsection{Onde o projeto está agora, de fato}
+
+Como nos módulos anteriores: no repositório \texttt{Dev-Sams1012/RetroForge}, nenhuma das pastas \texttt{estimation/} ou \texttt{scraping/} existe ainda, e nenhuma das duas linhas de CMake acima foi commitada. Este módulo entrega mais uma peça do roteiro incremental; o próximo Pull Request real precisa adicionar as duas pastas, suas classes, e as dependências de build necessárias, mantendo o CI (Módulo 1) verde.
+
+\subsection{Exercícios Práticos do Módulo 5}
+
+\begin{CaixaDesafio}
+Lembrete das etiquetas: \textbf{[projeto]} = vira arquivo/pasta permanente do repositório; \textbf{[laboratório]} = validação prática descartável (não precisa sobreviver no repositório depois de feito).
+
+\begin{enumerate}[label=\textbf{5.\arabic*}]
+    \item \textbf{[projeto]} Implemente \texttt{StorageEstimator} exatamente como apresentado. Escreva um \texttt{main()} temporário que chame \texttt{estimar()} para \texttt{Console::PS2} com um tamanho fictício de 4,7 GB e confirme que o resultado bate com a fração esperada (0.60). Confirme também que \texttt{Console::DreamcastModificado} devolve o mesmo tamanho original -- nenhuma economia prometida.
+    \item \textbf{[laboratório]} Implemente \texttt{BatchStorageEstimator} e monte uma lista de 20 \texttt{ItemParaEstimativa} fictícios (apontando para arquivos que precisam existir de verdade, já que \texttt{std::filesystem::file\_size} exige isso -- use \texttt{std::ofstream} para criá-los com tamanhos variados). Confirme que \texttt{estimar\_lote} devolve 20 resultados, na mesma ordem da entrada. Este \texttt{main()} é descartável.
+    \item \textbf{[projeto]} Implemente \texttt{XxHashCalculator} e confirme, com um teste manual, que hashear o mesmo arquivo duas vezes produz sempre a mesma string hexadecimal, e que dois arquivos com conteúdos diferentes produzem hashes diferentes. Depois, implemente o parsing real de JSON dentro de \texttt{MetadataScraperClient::buscar\_metadados} (deixado como \textit{placeholder} no corpo deste módulo) usando uma biblioteca de sua escolha.
+    \item \textbf{[laboratório]} Sem acesso real à API: crie um teste manual que simule as três respostas possíveis de \texttt{MetadataScraperClient::buscar\_metadados} (\texttt{std::nullopt}, hash desconhecida, hash reconhecida) e confirme que a camada que consome o resultado trata as três situações de forma visivelmente diferente -- por exemplo, imprimindo mensagens distintas para cada caso.
+    \item \textbf{[laboratório]} Discuta por escrito (não precisa codificar): o \texttt{BatchHashScanner} atual faz uma requisição de rede por arquivo, dentro de \texttt{MetadataScraperClient}, se você encadeá-los. Para uma pasta de 50 jogos, isso significa até 50 requisições HTTP separadas. Como você adaptaria o fluxo para enviar as 50 hashes calculadas em uma \textbf{única} requisição em lote, supondo que a API de metadados suportasse isso? Que classe nova (ou método adicional) seria necessário, e ela pertenceria a \texttt{scraping/} ou a uma pasta diferente?
+    \item \textbf{[laboratório]} Compare, com um pequeno teste manual, o comportamento de \texttt{BatchStorageEstimator} (mutex defensivo sobre um \texttt{vector} pré-dimensionado) com o de \texttt{BatchHashScanner} (mutex estritamente necessário sobre um \texttt{unordered\_map}). Remova o mutex de \texttt{BatchStorageEstimator} e confirme, com um \textit{sanitizer} de threads (\texttt{-fsanitize=thread}, se disponível no seu compilador) ou apenas por análise, que nenhuma condição de corrida real acontece. Depois, tente remover o mutex de \texttt{BatchHashScanner} e explique por escrito por que isso seria perigoso.
+\end{enumerate}
+\end{CaixaDesafio}
+
+\begin{CaixaResumo}
+Neste módulo você aprendeu:
+\begin{itemize}
+    \item Por que estimativa de armazenamento (barata, sempre executada) e scraping de metadados (caro, sob demanda) merecem pastas e classes completamente separadas, apesar de ambas lidarem com ``metadados'' em um sentido amplo -- a mesma disciplina de Responsabilidade Única aplicada, desta vez, à granularidade de \textbf{pastas} inteiras, não só de classes.
+    \item Como um \texttt{switch} explícito sobre \texttt{Console} em \texttt{StorageEstimator} reaproveita o mesmo hábito de segurança do Módulo 2 (\texttt{-Wswitch} forçando tratamento de todo valor do enum), mesmo em uma classe que nunca decide rotas de compressão de verdade.
+    \item Que a separação entre \texttt{concurrency::ThreadPool} (genérica) e \texttt{batch::BatchConversionManager} (específica de domínio), estabelecida no Módulo 4, permitiu que este módulo reaproveitasse a Thread Pool \textbf{três vezes} -- em \texttt{BatchStorageEstimator} e \texttt{BatchHashScanner} -- sem que nenhuma dessas classes precisasse herdar uma dependência de \texttt{compression::CompressionRouter} que não fazia sentido para elas.
+    \item Como a técnica de leitura em \textit{chunks} do Módulo 0 (nunca alocar um buffer do tamanho do arquivo inteiro) se torna indispensável, e não apenas ilustrativa, no momento em que o Scraper precisa hashear um arquivo de 4,7 GB de verdade.
+    \item Por que \texttt{std::optional<ResultadoScraping>} com um campo booleano interno distingue três situações semanticamente diferentes (falha de rede, hash desconhecida, hash reconhecida) -- o mesmo padrão de resultados tipados que o Módulo 3 usou com \texttt{ResultadoRoteamento}, em vez de sobrecarregar um \texttt{bool} ou uma string vazia.
+    \item Que nem todo uso de mutex dentro de uma \texttt{ThreadPool} protege o mesmo tipo de risco: escrita em índices disjuntos de um \texttt{vector} pré-dimensionado (\texttt{BatchStorageEstimator}) é um risco mais teórico do que escrita concorrente no mesmo \texttt{unordered\_map} (\texttt{BatchHashScanner}), e reconhecer essa diferença evita tanto sincronização insuficiente quanto sincronização desnecessária.
+    \item Que duas novas dependências externas (\texttt{xxHash} via \texttt{FetchContent}, \texttt{libcurl} via \texttt{find\_package}) seguem exatamente as duas estratégias que o Módulo 1 já havia anunciado, sem exigir nenhuma decisão nova de infraestrutura de build.
+\end{itemize}
+
+Com o console identificado (Módulo 2), roteado com segurança (Módulo 3), processado em paralelo (Módulo 4), e agora estimado e opcionalmente enriquecido com metadados online (este módulo), o RetroForge já cobre o ciclo de vida completo de um único arquivo ou de um HD inteiro -- exceto por um detalhe que todos os módulos anteriores assumiram como resolvido sem nunca formalizá-lo: \textbf{como, exatamente, uma pasta se transforma na lista de arquivos que alimenta tudo isso}. O Módulo 6 vai se afastar temporariamente da regra de negócio para tratar de integração com o sistema operacional e versionamento -- e o Módulo 7, mais adiante, vai finalmente formalizar a varredura recursiva de diretórios (\texttt{std::filesystem::recursive\_directory\_iterator}) que \texttt{BatchStorageEstimator} e \texttt{BatchHashScanner} já pressupõem receber pronta.
+\end{CaixaResumo}
